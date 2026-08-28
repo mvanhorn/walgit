@@ -17,6 +17,7 @@ LFS pre-push. `AGENTS.md §1.4` lists LFS as part of the surface; this is the de
 `proxy` streams every byte through walgit (or an edge). `signed_url` hands out store URLs instead, in both
 directions, and falls back to the proxying href per object whenever it cannot: signing is never load-bearing and
 a signing failure is a WARN line, not a failed push.
+
 | | `proxy` | `signed_url` |
 |---|---|---|
 | batch `download` | our href (`static_object`) | `signed_get_url` |
@@ -33,6 +34,7 @@ body that does not match it and puts the header carrying it inside the signature
 - **GCS** cannot: `x-goog-hash` validates only CRC32C/MD5, which walgit does not know for an object it has never
   seen, and `x-goog-content-sha256` is `UNSIGNED-PAYLOAD` on the signed-URL path. Uploads stay proxied there.
 - **memory** signs nothing.
+
 Two things follow. `verify` stays walgit's: the store guarantees the content, we still confirm the object arrived
 at the size git-lfs promised — and since `authenticated: true` tells git-lfs to add no credential (it applies the
 flag to the `verify` POST as well), the `verify` action carries the credential the client used on the batch,
