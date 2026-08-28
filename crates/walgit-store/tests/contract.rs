@@ -58,7 +58,7 @@ async fn test_signed_put_is_bound_or_absent(store: &DynStore, key: &str) {
     let body = Bytes::from_static(b"an lfs object's bytes");
     let digest: [u8; 32] = Sha256::digest(&body).into();
     let put = store
-        .signed_put_url(key, std::time::Duration::from_secs(900), &digest)
+        .signed_put_url(key, std::time::Duration::from_secs(90), &digest)
         .await
         .expect("signed_put_url must not fail on a healthy store");
     let Some(put) = put else {
@@ -70,7 +70,7 @@ async fn test_signed_put_is_bound_or_absent(store: &DynStore, key: &str) {
         "not a URL: {}",
         put.url
     );
-    assert_eq!(put.expires_in, std::time::Duration::from_secs(900));
+    assert_eq!(put.expires_in, std::time::Duration::from_secs(90));
     // The digest travels base64-encoded (S3's `x-amz-checksum-sha256` wire form);
     // whichever header the backend names, one of them must carry exactly it.
     let expected = base64::engine::general_purpose::STANDARD.encode(digest);
@@ -708,7 +708,11 @@ async fn memory_contract() {
 async fn memory_signs_no_puts() {
     let store: DynStore = Arc::new(MemoryStore::new());
     let put = store
-        .signed_put_url("lfs/objects/aa/bb/aabb", std::time::Duration::from_secs(60), &[0u8; 32])
+        .signed_put_url(
+            "lfs/objects/aa/bb/aabb",
+            std::time::Duration::from_secs(90),
+            &[0u8; 32],
+        )
         .await
         .expect("signing");
     assert!(put.is_none());

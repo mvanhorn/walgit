@@ -30,15 +30,16 @@ pub struct MemoryStore {
     /// Test switch: `signed_get_url` / `signed_put_url` fail like a store whose
     /// signing permission is unavailable or denied.
     pub signing_fails: bool,
-    /// Tests of `serve_via = "signed_url"` uploads: when set, `signed_put_url`
-    /// answers like a backend that can sign a checksummed PUT, so the LFS batch's
-    /// upload branch is exercisable without a bucket. Off = the real answer for
-    /// this backend (`Ok(None)`).
-    pub fake_signed_puts: std::sync::atomic::AtomicBool,
+    /// Tests of `serve_via = "signed_url"` uploads. With a base URL set,
+    /// `signed_put_url` answers like a backend that can sign a checksummed PUT:
+    /// `<base>/<key>` plus the checksum header such a backend would sign. Unset =
+    /// this backend's real answer (`Ok(None)`). Point it at a mock bucket and the
+    /// whole client-side flow is testable without one.
+    pub fake_signed_put_base: Mutex<Option<String>>,
 }
 
-/// Header name of the fake presigned PUT's checksum. A real backend's name is
-/// its own (`x-amz-checksum-sha256` on S3); callers copy whatever they are given.
+/// Header the fake presigned PUT makes the client send. A real backend names its
+/// own (`x-amz-checksum-sha256` on S3); callers copy whatever they are handed.
 pub const FAKE_SIGNED_PUT_CHECKSUM_HEADER: &str = "x-walgit-test-checksum-sha256";
 
 impl MemoryStore {
@@ -100,11 +101,11 @@ impl ObjectStore for MemoryStore {
                 "signBlob for {key}: PERMISSION_DENIED (VPC_SERVICE_CONTROLS) [test]"
             )));
         }
-        if !self.fake_signed_puts.load(Ordering::Relaxed) {
+        let Some(base) = self.fake_signed_put_base.lock().clone() else {
             return Ok(None);
-        }
+        };
         Ok(Some(crate::SignedPut {
-            url: format!("https://storage.example.test/test-bucket/{key}?X-Test-Signature=1"),
+            url: format!("{base}/{key}?X-Test-Signature=1"),
             headers: vec![(
                 FAKE_SIGNED_PUT_CHECKSUM_HEADER.to_string(),
                 base64::engine::general_purpose::STANDARD.encode(checksum_sha256),
