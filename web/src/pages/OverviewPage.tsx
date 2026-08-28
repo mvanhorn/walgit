@@ -330,16 +330,18 @@ function OpsBox({ repo, overview, onChanged }: { repo: string; overview: Overvie
                       ),
                     )}
                     {s.params.includes("at_seq") && (
-                      <label className="small muted">
-                        at_seq{" "}
-                        <input type="number" min={1} max={head} step={1} value={atSeq} onChange={(e) => setAtSeq(e.target.value)} />{" "}
-                        <span>of {head} — the state the WAL was in at that sequence; live refs stay at the head.</span>{" "}
+                      <span className="small muted">
+                        <label>
+                          at_seq{" "}
+                          <input type="number" min={1} max={head} step={1} value={atSeq} onChange={(e) => setAtSeq(e.target.value)} />
+                        </label>{" "}
+                        of {head} — the state the WAL was in at that sequence; live refs stay at the head.{" "}
                         {atSeq && (
                           <a href={`${repoApi(repo)}/snapshot/${encodeURIComponent(atSeq)}`} target="_blank" rel="noreferrer">
                             JSON
                           </a>
                         )}
-                      </label>
+                      </span>
                     )}
                     {s.params.includes("strategy") && (
                       <label className="small muted">

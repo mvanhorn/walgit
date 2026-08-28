@@ -201,11 +201,11 @@ pub async fn run(action: WalAction, cfg: &Arc<Config>) -> Result<()> {
                 id,
                 at_seq,
                 out,
-                std::sync::Arc::new(|line| println!("{line}")),
+                Arc::new(|line| println!("{line}")),
             )
             .await?;
             println_kv("git_dir", &snap.git_dir);
-            println_kv("refs", snap.refs.len());
+            println_kv("refs", snap.ref_count);
             println_kv("packs", snap.packs.len());
             println_kv("replayed_entries", snap.entries);
             println_kv("wal_head_seq", snap.head_seq);
