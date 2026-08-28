@@ -118,13 +118,7 @@ async fn snapshot_rewinds_to_a_seq_without_moving_the_serving_copy() -> anyhow::
     let git_dir = std::path::PathBuf::from(snap["git_dir"].as_str().unwrap());
     assert_eq!(
         git_dir,
-        server
-            .state
-            .cfg
-            .cache
-            .dir
-            .join("snapshots/o/r/1/o/r.git")
-            .to_path_buf()
+        server.state.cfg.cache.dir.join("snapshots/o/r/1/o/r.git")
     );
     assert_eq!(
         git_out(&git_dir, &["rev-parse", "refs/heads/main"]),
