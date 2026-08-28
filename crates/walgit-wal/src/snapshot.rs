@@ -113,7 +113,10 @@ pub fn snapshot_dir(cache_dir: &Path, id: &RepoId, at_seq: u64) -> PathBuf {
 pub fn read_snapshot(dir: &Path) -> Option<Snapshot> {
     let bytes = std::fs::read(dir.join(MARKER)).ok()?;
     let snap: Snapshot = serde_json::from_slice(&bytes).ok()?;
-    Path::new(&snap.git_dir).join("HEAD").is_file().then_some(snap)
+    Path::new(&snap.git_dir)
+        .join("HEAD")
+        .is_file()
+        .then_some(snap)
 }
 
 /// Rebuild `id` as it was at `at_seq` under `<cache.dir>/snapshots/…`,
@@ -236,18 +239,19 @@ async fn materialize_inner(
     let mut start_seq = 0u64;
     let mut pack_set: Vec<PackRef> = Vec::new();
     if let Some(cp) = manifest.checkpoint.as_ref().filter(|c| c.seq <= at_seq) {
-        let (_, bytes) = handle
-            .store()
-            .get_bytes(&cp.key)
-            .await?
-            .ok_or_else(|| WalError::Corrupt(format!("checkpoint object {} missing", cp.key)))?;
+        let (_, bytes) =
+            handle.store().get_bytes(&cp.key).await?.ok_or_else(|| {
+                WalError::Corrupt(format!("checkpoint object {} missing", cp.key))
+            })?;
         let cpo = walgit_proto::v1::Checkpoint::decode(bytes.as_ref())
             .map_err(|e| WalError::Corrupt(format!("checkpoint decode: {e}")))?;
         let (_, rb) = handle
             .store()
             .get_bytes(&cpo.refs_key)
             .await?
-            .ok_or_else(|| WalError::Corrupt(format!("checkpoint refs {} missing", cpo.refs_key)))?;
+            .ok_or_else(|| {
+                WalError::Corrupt(format!("checkpoint refs {} missing", cpo.refs_key))
+            })?;
         let snap = walgit_proto::v1::RefSnapshot::decode(rb.as_ref())
             .map_err(|e| WalError::Corrupt(format!("checkpoint refs decode: {e}")))?;
         local.load_ref_snapshot(&snap)?;
@@ -674,7 +678,10 @@ mod tests {
         assert_eq!(snap.refs[0].sha, f.tips[1]);
         let dir = snapshot_dir(cold_cache.path(), &f.id, 2);
         assert!(dir.join(MARKER).is_file());
-        assert_eq!(run_git(Path::new(&snap.git_dir), &["rev-parse", "HEAD"]), f.tips[1]);
+        assert_eq!(
+            run_git(Path::new(&snap.git_dir), &["rev-parse", "HEAD"]),
+            f.tips[1]
+        );
 
         // Second call: the marker is trusted, nothing is rebuilt.
         let (again, built) = snapshot_at(cold.clone(), f.id.clone(), 2, silent())

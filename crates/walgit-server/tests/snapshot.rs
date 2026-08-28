@@ -56,7 +56,10 @@ fn terminal(body: &str) -> (String, serde_json::Value) {
 }
 
 /// The `snapshot` op's result value, or the error message it failed with.
-async fn run_snapshot(server: &Server, query: &str) -> anyhow::Result<Result<serde_json::Value, String>> {
+async fn run_snapshot(
+    server: &Server,
+    query: &str,
+) -> anyhow::Result<Result<serde_json::Value, String>> {
     let (status, body) = post(server, &format!("/o/r/api/ops/snapshot{query}")).await?;
     assert_eq!(status, 200, "{body}");
     let (event, data) = terminal(&body);
@@ -100,7 +103,10 @@ async fn snapshot_rewinds_to_a_seq_without_moving_the_serving_copy() -> anyhow::
     let snap = &value["snapshot"];
     assert_eq!(snap["at_seq"], 1);
     assert_eq!(snap["head_seq"], 2, "the WAL head is where it was");
-    assert_eq!(snap["from_seq"], 0, "no checkpoint yet: replay from the start");
+    assert_eq!(
+        snap["from_seq"], 0,
+        "no checkpoint yet: replay from the start"
+    );
     assert_eq!(snap["entries"], 1);
     assert_eq!(snap["ref_count"], 1);
     assert_eq!(snap["refs"][0]["name"], "refs/heads/main");
@@ -120,7 +126,10 @@ async fn snapshot_rewinds_to_a_seq_without_moving_the_serving_copy() -> anyhow::
             .join("snapshots/o/r/1/o/r.git")
             .to_path_buf()
     );
-    assert_eq!(git_out(&git_dir, &["rev-parse", "refs/heads/main"]), tips[0]);
+    assert_eq!(
+        git_out(&git_dir, &["rev-parse", "refs/heads/main"]),
+        tips[0]
+    );
     assert!(
         git_in(&git_dir, &["cat-file", "-e", &tips[1]]).is_err(),
         "the rewound copy must not contain the second commit"
