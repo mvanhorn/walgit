@@ -300,8 +300,8 @@ async fn materialize_inner(
         let source = if src.is_file() && !src.is_symlink() {
             for ext in ["pack", "idx", "rev", "bitmap", "commit-graph"] {
                 let f = src.with_extension(ext);
-                if let (true, Some(name)) = (f.is_file(), f.file_name()) {
-                    std::fs::copy(&f, tmp.join(name))?;
+                if f.is_file() {
+                    std::fs::copy(&f, tmp.join(format!("pack-{}.{ext}", p.checksum)))?;
                 }
             }
             narrate(format!("pack {}: copied from the local copy", p.checksum));
