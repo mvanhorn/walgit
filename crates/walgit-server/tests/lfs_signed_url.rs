@@ -309,7 +309,11 @@ async fn bucket_put(
         b.bad_digests.fetch_add(1, Ordering::SeqCst);
         return axum::http::StatusCode::BAD_REQUEST;
     }
-    match b.store.put_bytes(&key, body, walgit_store::PutMode::Overwrite).await {
+    match b
+        .store
+        .put_bytes(&key, body, walgit_store::PutMode::Overwrite)
+        .await
+    {
         Ok(_) => axum::http::StatusCode::OK,
         Err(_) => axum::http::StatusCode::INTERNAL_SERVER_ERROR,
     }

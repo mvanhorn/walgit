@@ -1061,7 +1061,8 @@ mod tests {
             .expect("s3 signs checksummed PUTs");
 
         assert!(
-            put.url.starts_with("https://s3.us-east-1.amazonaws.test/walgit-test/"),
+            put.url
+                .starts_with("https://s3.us-east-1.amazonaws.test/walgit-test/"),
             "{}",
             put.url
         );
@@ -1073,7 +1074,11 @@ mod tests {
             .map(|(_, value)| value.as_str());
         assert_eq!(
             checksum,
-            Some(base64::engine::general_purpose::STANDARD.encode(digest).as_str()),
+            Some(
+                base64::engine::general_purpose::STANDARD
+                    .encode(digest)
+                    .as_str()
+            ),
             "headers: {:?}",
             put.headers
         );
@@ -1093,7 +1098,11 @@ mod tests {
         let unsigned = "https://s3.test/b/k?X-Amz-SignedHeaders=host";
 
         assert!(signature_covers(signed, &headers, CHECKSUM_SHA256_HEADER));
-        assert!(!signature_covers(unsigned, &headers, CHECKSUM_SHA256_HEADER));
+        assert!(!signature_covers(
+            unsigned,
+            &headers,
+            CHECKSUM_SHA256_HEADER
+        ));
         assert!(!signature_covers(signed, &[], CHECKSUM_SHA256_HEADER));
         assert!(!signature_covers(
             "https://s3.test/b/k",
