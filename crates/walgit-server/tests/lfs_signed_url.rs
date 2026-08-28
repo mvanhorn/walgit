@@ -2,24 +2,27 @@
 //! presigned, checksummed PUT straight to the store, `verify` stays on walgit.
 //!
 //! The in-memory store signs nothing (like every backend that cannot bind a
-//! sha256 on a PUT), so it carries a test switch — `fake_signed_puts` — that
-//! answers the way a signing backend does. What is asserted here is walgit's half
-//! of the contract: which href a client is given, that the store's signed headers
-//! reach it verbatim, that `verify` is unchanged and still authenticated, and that
-//! anything short of a bound PUT keeps the bytes coming through walgit.
+//! sha256 on a PUT), so it takes a `fake_signed_put_base`: point it anywhere and
+//! it answers the way a signing backend does. Pointed at a URL nobody serves, the
+//! batch response itself is under test; pointed at a mock bucket that checks the
+//! checksum the way S3 does, real `git lfs push` is.
 
 mod harness;
 
-use std::sync::atomic::Ordering;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use anyhow::Result;
 use base64::Engine as _;
-use harness::Server;
+use harness::{Server, TestRepo, git_in};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
+use walgit_store::ObjectStoreExt;
 use walgit_store::memory::{FAKE_SIGNED_PUT_CHECKSUM_HEADER, MemoryStore};
 
 const TOKEN: &str = "writer-token";
+/// Nothing listens here: the tests that use it read the batch answer, not bytes.
+const FAKE_BUCKET: &str = "https://storage.example.test/test-bucket";
 
 fn tokens(cfg: &mut walgit_config::Config) {
     cfg.server.auth.mode = walgit_config::AuthMode::Token;
@@ -80,11 +83,11 @@ async fn signed_url_uploads_go_to_the_store_with_the_oid_bound_to_the_put() -> R
     let body = b"lfs bytes that never touch walgit".to_vec();
     let oid = hex::encode(Sha256::digest(&body));
     let store = MemoryStore::shared();
-    store.fake_signed_puts.store(true, Ordering::Relaxed);
+    *store.fake_signed_put_base.lock() = Some(FAKE_BUCKET.to_string());
     let server = Server::start_with_store_and_tweak(store, |c| {
         tokens(c);
         c.lfs.serve_via = walgit_config::BundleServe::SignedUrl;
-        c.lfs.signed_url_ttl = std::time::Duration::from_secs(900);
+        c.lfs.signed_url_ttl = std::time::Duration::from_secs(90);
     })
     .await?;
     create_repo(&server).await?;
@@ -95,8 +98,11 @@ async fn signed_url_uploads_go_to_the_store_with_the_oid_bound_to_the_put() -> R
     assert_eq!(
         upload["href"].as_str(),
         Some(
-            format!("https://storage.example.test/test-bucket/repos/o/r/lfs/objects/{}/{}/{oid}?X-Test-Signature=1",
-                &oid[..2], &oid[2..4])
+            format!(
+                "{FAKE_BUCKET}/repos/o/r/lfs/objects/{}/{}/{oid}?X-Test-Signature=1",
+                &oid[..2],
+                &oid[2..4]
+            )
             .as_str()
         ),
         "the upload href is the store's signed URL: {obj}"
@@ -112,7 +118,7 @@ async fn signed_url_uploads_go_to_the_store_with_the_oid_bound_to_the_put() -> R
         ),
         "signed headers must reach the client verbatim: {obj}"
     );
-    assert_eq!(upload["expires_in"].as_u64(), Some(900));
+    assert_eq!(upload["expires_in"].as_u64(), Some(90));
 
     // `verify` is walgit's, unchanged, and still authenticated: `authenticated`
     // stops git-lfs adding walgit's credential to the store's URL, so the one it
@@ -198,7 +204,11 @@ async fn a_store_that_cannot_bind_the_checksum_keeps_the_upload_on_walgit() -> R
     for signing_fails in [false, true] {
         let mut store = MemoryStore::new();
         store.signing_fails = signing_fails;
-        let server = Server::start_with_store_and_tweak(std::sync::Arc::new(store), |c| {
+        if signing_fails {
+            // Signing is configured, and denied: still the proxy href, not a 500.
+            *store.fake_signed_put_base.lock() = Some(FAKE_BUCKET.to_string());
+        }
+        let server = Server::start_with_store_and_tweak(Arc::new(store), |c| {
             tokens(c);
             c.lfs.serve_via = walgit_config::BundleServe::SignedUrl;
         })
@@ -226,7 +236,7 @@ async fn an_object_over_the_cap_is_never_signed() -> Result<()> {
     let body = vec![b'x'; 4096];
     let oid = hex::encode(Sha256::digest(&body));
     let store = MemoryStore::shared();
-    store.fake_signed_puts.store(true, Ordering::Relaxed);
+    *store.fake_signed_put_base.lock() = Some(FAKE_BUCKET.to_string());
     let server = Server::start_with_store_and_tweak(store, |c| {
         tokens(c);
         c.lfs.serve_via = walgit_config::BundleServe::SignedUrl;
@@ -261,8 +271,161 @@ async fn an_object_over_the_cap_is_never_signed() -> Result<()> {
     assert!(
         r["objects"][0]["actions"]["upload"]["href"]
             .as_str()
-            .is_some_and(|h| h.starts_with("https://storage.example.test/")),
+            .is_some_and(|h| h.starts_with(FAKE_BUCKET)),
         "{r}"
     );
     Ok(())
+}
+
+/// A mock bucket that behaves like S3 on a presigned, checksummed PUT: it refuses
+/// a body whose sha256 is not the one in the signed header (S3's `BadDigest`), and
+/// on success the object is in the store — which is where walgit's `verify` looks.
+struct Bucket {
+    store: Arc<MemoryStore>,
+    puts: AtomicUsize,
+    bad_digests: AtomicUsize,
+    authorized_puts: AtomicUsize,
+}
+
+async fn bucket_put(
+    axum::extract::State(b): axum::extract::State<Arc<Bucket>>,
+    axum::extract::Path(key): axum::extract::Path<String>,
+    headers: axum::http::HeaderMap,
+    body: bytes::Bytes,
+) -> axum::http::StatusCode {
+    b.puts.fetch_add(1, Ordering::SeqCst);
+    if headers.contains_key(axum::http::header::AUTHORIZATION) {
+        // A presigned URL carries its own signature; a second credential is what
+        // S3 rejects as "only one auth mechanism allowed".
+        b.authorized_puts.fetch_add(1, Ordering::SeqCst);
+        return axum::http::StatusCode::BAD_REQUEST;
+    }
+    let signed = headers
+        .get(FAKE_SIGNED_PUT_CHECKSUM_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_owned();
+    if signed != base64::engine::general_purpose::STANDARD.encode(Sha256::digest(&body)) {
+        b.bad_digests.fetch_add(1, Ordering::SeqCst);
+        return axum::http::StatusCode::BAD_REQUEST;
+    }
+    match b.store.put_bytes(&key, body, walgit_store::PutMode::Overwrite).await {
+        Ok(_) => axum::http::StatusCode::OK,
+        Err(_) => axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+    }
+}
+
+/// The whole flow with the real client, under token auth: `git lfs push` sends
+/// the bytes to the bucket with the signed checksum header and none of walgit's
+/// credential, then comes back to walgit for `verify` — which is authenticated
+/// only by the header the batch put on that action, since `authenticated: true`
+/// stops git-lfs consulting the credential helper for either request.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn git_lfs_pushes_straight_to_the_bucket_and_verifies_with_us() -> Result<()> {
+    if !git_lfs_present() {
+        eprintln!("git lfs not present; skipping");
+        return Ok(());
+    }
+    let store = MemoryStore::shared();
+    let bucket = Arc::new(Bucket {
+        store: store.clone(),
+        puts: AtomicUsize::new(0),
+        bad_digests: AtomicUsize::new(0),
+        authorized_puts: AtomicUsize::new(0),
+    });
+    let app = axum::Router::new()
+        .route("/{*key}", axum::routing::put(bucket_put))
+        .with_state(bucket.clone())
+        .layer(axum::extract::DefaultBodyLimit::disable());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let bucket_base = format!("http://{}", listener.local_addr()?);
+    tokio::spawn(async move { axum::serve(listener, app).await });
+
+    *store.fake_signed_put_base.lock() = Some(bucket_base);
+    let server = Server::start_with_store_and_tweak(store, |c| {
+        tokens(c);
+        c.lfs.serve_via = walgit_config::BundleServe::SignedUrl;
+    })
+    .await?;
+    create_repo(&server).await?;
+
+    let payload = b"bytes that only ever reach the bucket\n";
+    let src = TestRepo::synthetic(1, 1)?;
+    // A credential helper, not a blanket `http.extraHeader`: it is consulted only
+    // for the requests git-lfs decides need our credential, which is the
+    // distinction `authenticated` draws and this test rests on.
+    let helper = bearer_helper(&src)?;
+    git_in(&src, &["config", "credential.helper", &helper])?;
+    git_in(&src, &["lfs", "install", "--local"])?;
+    git_in(&src, &["lfs", "track", "*.bin"])?;
+    std::fs::write(src.join("blob.bin"), payload)?;
+    git_in(&src, &["add", ".gitattributes", "blob.bin"])?;
+    git_in(&src, &["commit", "-m", "lfs"])?;
+    git_in(
+        &src,
+        &["remote", "add", "origin", &server.repo_url("o", "r")],
+    )?;
+    // The LFS half on its own: batch, transfer, verify — no git objects involved.
+    git_in(&src, &["lfs", "push", "origin", "main"])?;
+
+    assert_eq!(
+        bucket.puts.load(Ordering::SeqCst),
+        1,
+        "git-lfs uploaded to the bucket"
+    );
+    assert_eq!(bucket.bad_digests.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        bucket.authorized_puts.load(Ordering::SeqCst),
+        0,
+        "walgit's credential must never travel to the bucket"
+    );
+    // The object is ours from here on: the next batch reports it present.
+    let oid = hex::encode(Sha256::digest(payload));
+    let r = upload_batch(&server, &oid, payload.len()).await?;
+    assert!(
+        r["objects"][0].get("actions").is_none(),
+        "the bucket's object is ours now: {r}"
+    );
+    assert_eq!(
+        server
+            .store
+            .get_bytes(&format!(
+                "repos/o/r/lfs/objects/{}/{}/{oid}",
+                &oid[..2],
+                &oid[2..4]
+            ))
+            .await?
+            .expect("stored")
+            .1
+            .as_ref(),
+        payload
+    );
+    Ok(())
+}
+
+/// A `git credential` helper (git ≥ 2.46 authtype protocol) that hands out
+/// `TOKEN`. Written next to the repo so nothing global is touched.
+fn bearer_helper(dir: &std::path::Path) -> Result<String> {
+    let path = dir.join("bearer-helper");
+    std::fs::write(
+        &path,
+        format!(
+            "#!/bin/sh\ncase \"$1\" in get) while IFS= read -r l; do [ -z \"$l\" ] && break; done; \
+             printf 'capability[]=authtype\\nauthtype=Bearer\\ncredential={TOKEN}\\n\\n' ;; esac\n"
+        ),
+    )?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))?;
+    }
+    Ok(path.display().to_string())
+}
+
+fn git_lfs_present() -> bool {
+    std::process::Command::new("git")
+        .args(["lfs", "version"])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
 }

@@ -877,7 +877,7 @@ impl ObjectStore for S3Store {
     }
 }
 
-/// The SigV4 header S3 validates the uploaded body's SHA-256 against.
+/// The header S3 validates the uploaded body's SHA-256 against.
 const CHECKSUM_SHA256_HEADER: &str = "x-amz-checksum-sha256";
 
 /// Whether `header` is both required of the client and inside the signature:
@@ -1311,7 +1311,7 @@ mod tests {
         let put = store
             .signed_put_url(
                 "repos/o/r/lfs/objects/aa/bb/aabb",
-                Duration::from_secs(900),
+                Duration::from_secs(90),
                 &digest,
             )
             .await
@@ -1323,7 +1323,7 @@ mod tests {
             "{}",
             put.url
         );
-        assert_eq!(put.expires_in, Duration::from_secs(900));
+        assert_eq!(put.expires_in, Duration::from_secs(90));
         let checksum = put
             .headers
             .iter()

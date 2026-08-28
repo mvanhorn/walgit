@@ -39,6 +39,12 @@ flag to the `verify` POST as well), the `verify` action carries the credential t
 the way `X-Amz-*` rides the upload href. And `lfs.max_object_bytes` can only be enforced where the bytes pass
 through, so an object over the cap is not signed; it goes to the proxy href and is refused there with 413.
 
+Tests: `crates/walgit-server/tests/lfs_signed_url.rs` (a store that signs and one that cannot; the cap; and a
+real `git lfs push` against a mock bucket that checks the signed checksum the way S3 does, then `verify` here),
+`crates/walgit-store/tests/contract.rs` (`signed_put_url` is bound or absent, on every backend) and the S3
+signing unit tests in `crates/walgit-store/src/s3.rs` (the checksum header is required *and* inside
+`X-Amz-SignedHeaders`; signing needs no bucket).
+
 ## 2. Read-through upstream `upstream.lfs` (✅)
 A repository imported from another host keeps its LFS history in that host's LFS server (the import copies packs
 and refs, never LFS — without this, `repos/<o>/<r>/` has no `lfs/` prefix and every push with an LFS-tracked file
