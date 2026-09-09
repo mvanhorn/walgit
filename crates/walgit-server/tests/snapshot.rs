@@ -7,9 +7,12 @@ mod harness;
 use harness::{Server, git, git_in};
 
 /// Every await is bounded so a hang names the step instead of stalling CI.
+/// Per-step ceiling for the end-to-end snapshot flow.
+const STEP_TIMEOUT: std::time::Duration = std::time::Duration::from_mins(1);
+
 macro_rules! step {
     ($name:literal, $e:expr) => {
-        tokio::time::timeout(std::time::Duration::from_secs(60), $e)
+        tokio::time::timeout(STEP_TIMEOUT, $e)
             .await
             .unwrap_or_else(|_| panic!("step timed out: {}", $name))
     };
@@ -52,7 +55,7 @@ fn terminal(body: &str) -> (String, serde_json::Value) {
             out = Some((event, serde_json::from_str(&data).unwrap_or_default()));
         }
     }
-    out.unwrap_or_else(|| panic!("no terminal packet in:\n{body}"))
+    out.unwrap_or_else(|| unreachable!("no terminal packet in:\n{body}"))
 }
 
 /// The `snapshot` op's result value, or the error message it failed with.
@@ -64,13 +67,17 @@ async fn run_snapshot(
     assert_eq!(status, 200, "{body}");
     let (event, data) = terminal(&body);
     Ok(match event.as_str() {
-        "result" => Ok(data["value"].clone()),
-        _ => Err(data["message"].as_str().unwrap_or_default().to_string()),
+        "result" => Ok(data.get("value").cloned().unwrap_or_default()),
+        _ => Err(data
+            .get("message")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_string()),
     })
 }
 
-fn git_out(dir: &std::path::Path, args: &[&str]) -> String {
-    git_in(dir, args).unwrap().trim().to_string()
+fn git_out(dir: &std::path::Path, args: &[&str]) -> anyhow::Result<String> {
+    Ok(git_in(dir, args)?.trim().to_string())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -90,7 +97,7 @@ async fn snapshot_rewinds_to_a_seq_without_moving_the_serving_copy() -> anyhow::
             &["push", "-q", &server.repo_url("o", "r"), "main"],
             src.path(),
         )?;
-        tips.push(git_out(src.path(), &["rev-parse", "HEAD"]));
+        tips.push(git_out(src.path(), &["rev-parse", "HEAD"])?);
     }
     let id = walgit_git::RepoId::new("o", "r")?;
     let handle = step!("open", server.state.registry.open(&id))?;
@@ -121,7 +128,7 @@ async fn snapshot_rewinds_to_a_seq_without_moving_the_serving_copy() -> anyhow::
         server.state.cfg.cache.dir.join("snapshots/o/r/1/o/r.git")
     );
     assert_eq!(
-        git_out(&git_dir, &["rev-parse", "refs/heads/main"]),
+        git_out(&git_dir, &["rev-parse", "refs/heads/main"])?,
         tips[0]
     );
     assert!(
@@ -137,7 +144,7 @@ async fn snapshot_rewinds_to_a_seq_without_moving_the_serving_copy() -> anyhow::
     assert_eq!(handle.manifest().head_seq, 2);
     assert_eq!(handle.applied_seq(), 2);
     assert_eq!(
-        git_out(handle.local().path(), &["rev-parse", "refs/heads/main"]),
+        git_out(handle.local().path(), &["rev-parse", "refs/heads/main"])?,
         tips[1]
     );
 
