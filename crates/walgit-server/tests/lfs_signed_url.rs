@@ -100,8 +100,8 @@ async fn signed_url_uploads_go_to_the_store_with_the_oid_bound_to_the_put() -> R
         Some(
             format!(
                 "{FAKE_BUCKET}/repos/o/r/lfs/objects/{}/{}/{oid}?X-Test-Signature=1",
-                &oid[..2],
-                &oid[2..4]
+                oid.get(..2).unwrap_or_default(),
+                oid.get(2..4).unwrap_or_default()
             )
             .as_str()
         ),
@@ -395,8 +395,8 @@ async fn git_lfs_pushes_straight_to_the_bucket_and_verifies_with_us() -> Result<
             .store
             .get_bytes(&format!(
                 "repos/o/r/lfs/objects/{}/{}/{oid}",
-                &oid[..2],
-                &oid[2..4]
+                oid.get(..2).unwrap_or_default(),
+                oid.get(2..4).unwrap_or_default()
             ))
             .await?
             .expect("stored")
@@ -430,6 +430,5 @@ fn git_lfs_present() -> bool {
     std::process::Command::new("git")
         .args(["lfs", "version"])
         .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+        .is_ok_and(|o| o.status.success())
 }

@@ -148,42 +148,39 @@ pub async fn batch(
         if is_upload {
             // The bytes go straight to the bucket when the store can sign a PUT
             // that only accepts this oid's content; otherwise they come through us.
-            match signed_upload(st, &cfg, &store, &key, &o.oid, o.size).await {
-                Some(put) => {
-                    actions.upload = Some(Action {
-                        href: put.url,
-                        header: Some(put.headers.into_iter().collect()),
-                        expires_in: Some(put.expires_in.as_secs()),
-                    });
-                    authenticated = Some(true);
-                    // `verify` stays walgit's either way: the store guarantees the
-                    // content, we still confirm the object arrived at the promised
-                    // size. It needs a credential, and `authenticated` has just
-                    // told git-lfs to add none — so it carries the one the client
-                    // used on this batch, the way `X-Amz-*` rides the upload href.
-                    actions.verify = Some(Action {
-                        href: format!("{base}/info/lfs/verify"),
-                        header: crate::auth::client_authorization(headers).map(|value| {
-                            std::collections::HashMap::from([(
-                                axum::http::header::AUTHORIZATION.as_str().to_owned(),
-                                value,
-                            )])
-                        }),
-                        expires_in: None,
-                    });
-                }
-                None => {
-                    actions.upload = Some(Action {
-                        href: format!("{base}/info/lfs/objects/{}", o.oid),
-                        header: None,
-                        expires_in: None,
-                    });
-                    actions.verify = Some(Action {
-                        href: format!("{base}/info/lfs/verify"),
-                        header: None,
-                        expires_in: None,
-                    });
-                }
+            if let Some(put) = signed_upload(st, &cfg, &store, &key, &o.oid, o.size).await {
+                actions.upload = Some(Action {
+                    href: put.url,
+                    header: Some(put.headers.into_iter().collect()),
+                    expires_in: Some(put.expires_in.as_secs()),
+                });
+                authenticated = Some(true);
+                // `verify` stays walgit's either way: the store guarantees the
+                // content, we still confirm the object arrived at the promised
+                // size. It needs a credential, and `authenticated` has just
+                // told git-lfs to add none — so it carries the one the client
+                // used on this batch, the way `X-Amz-*` rides the upload href.
+                actions.verify = Some(Action {
+                    href: format!("{base}/info/lfs/verify"),
+                    header: crate::auth::client_authorization(headers).map(|value| {
+                        std::collections::HashMap::from([(
+                            axum::http::header::AUTHORIZATION.as_str().to_owned(),
+                            value,
+                        )])
+                    }),
+                    expires_in: None,
+                });
+            } else {
+                actions.upload = Some(Action {
+                    href: format!("{base}/info/lfs/objects/{}", o.oid),
+                    header: None,
+                    expires_in: None,
+                });
+                actions.verify = Some(Action {
+                    href: format!("{base}/info/lfs/verify"),
+                    header: None,
+                    expires_in: None,
+                });
             }
         } else if at_upstream {
             // Streamed through us (and persisted) on GET. The upstream's batch
