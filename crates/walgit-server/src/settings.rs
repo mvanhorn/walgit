@@ -78,7 +78,8 @@ pub async fn http_effective(
         .await
         .map_err(|e| ApiError::Internal(e.to_string()))?;
     let text = h
-        .effective_config()
+        .validated_effective_config()
+        .map_err(|e| ApiError::Internal(e.to_string()))?
         .public_settings_toml()
         .map_err(|e| ApiError::Internal(e.to_string()))?;
     Ok((
@@ -218,8 +219,7 @@ fn toml_json(v: &toml::Value) -> serde_json::Value {
     serde_json::to_value(v).unwrap_or(serde_json::Value::Null)
 }
 
-/// Everything the Settings tab needs in one answer: the strategies (with the
-/// next fire time and a human preview), placement (host-level, read-only),
+/// Everything the Settings tab needs in one answer: placement (host-level, read-only),
 /// the effective config as a flat `key → {value, source}` map restricted to
 /// the settings sections, the current settings document and the history.
 pub async fn http_describe(
@@ -233,7 +233,9 @@ pub async fn http_describe(
         .await
         .map_err(|e| ApiError::Internal(e.to_string()))?;
     let settings = h.settings();
-    let effective = h.effective_config();
+    let effective = h
+        .validated_effective_config()
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
     Ok((
         StatusCode::OK,
         [(axum::http::header::CACHE_CONTROL, "no-store")],
@@ -248,28 +250,6 @@ fn describe_json(
     effective: &walgit_config::Config,
     settings: Option<&walgit_proto::v1::RepoSettings>,
 ) -> Result<serde_json::Value, ApiError> {
-    let now = std::time::SystemTime::now();
-    let strategies: Vec<serde_json::Value> = effective
-        .bundles
-        .strategy
-        .iter()
-        .map(|s| {
-            let (next, human) = match walgit_bundle::schedule::parse_schedule(&s.schedule) {
-                Ok(sch) => (
-                    walgit_bundle::schedule::next_fire_after(&sch, now).map(|t| chrono::DateTime::<chrono::Utc>::from(t).to_rfc3339()),
-                    human_schedule(&s.schedule),
-                ),
-                Err(e) => (None, format!("invalid: {e}")),
-            };
-            json!({
-                "name": s.name, "kind": format!("{:?}", s.kind).to_lowercase(), "base": s.base, "schedule": s.schedule,
-                "schedule_human": human, "next": next, "keep": s.keep, "backfill_max": s.backfill_max,
-                "min_commits": s.min_commits.unwrap_or(effective.bundles.min_commits),
-                "refs": walgit_bundle::slots::default_refs(&effective.bundles, s),
-                "chain": s.chain, "filter": s.filter,
-            })
-        })
-        .collect();
     // Sources: every key of the settings sections; a key is "setting" when the
     // repo document sets it (rev/author), else "host" (walgit.toml ⊕ env).
     let host_doc: toml::Table =
@@ -299,19 +279,11 @@ fn describe_json(
             if k.ends_with("token_env") {
                 continue;
             }
-            // Array-of-tables (strategies) count as set when the document has the array.
-            let top = k.split('.').take(2).collect::<Vec<_>>().join(".");
-            let is_set = set_keys.contains(&k)
-                || set_keys
-                    .iter()
-                    .any(|s| s.starts_with(&format!("{top}.")) || s == &top)
-                    && k.starts_with(&top)
-                    && k.contains("strategy");
             fields.push(json!({
                 "key": k,
                 "value": toml_json(&v),
                 "host_value": host_map.get(&k).map(toml_json),
-                "source": if is_set { "setting" } else { "host" },
+                "source": if set_keys.contains(&k) { "setting" } else { "host" },
             }));
         }
     }
@@ -320,14 +292,12 @@ fn describe_json(
         "repo": h.id().to_string(),
         "settings": settings.map(|s| json!({"revision": s.revision, "author": s.author, "message": s.message, "updated_at": ts(s.updated_at.as_ref()), "toml": s.toml})).unwrap_or(json!({"revision": 0, "toml": ""})),
         "sections": walgit_config::SETTINGS_SECTIONS,
-        "strategies": strategies,
-        "bundles": {"enabled": effective.bundles.enabled, "min_commits": effective.bundles.min_commits, "main_only": effective.bundles.main_only},
         "maintenance": {
             "checkpoints": effective.maintenance.checkpoints,
             "interval_secs": effective.maintenance.interval.as_secs(),
             "this_host": {"name": crate::maintain::host_name(st), "maintains": st.cfg.placement.maintains(h.id().owner(), h.id().name()), "serves": st.cfg.placement.serves(h.id().owner(), h.id().name()), "disk": format!("{:?}", st.cfg.maintenance.disk).to_lowercase(), "max_pack_bytes": st.cfg.maintenance.max_pack_bytes.as_u64(), "cache_budget_bytes": st.cfg.cache_budget_bytes(), "roles": st.cfg.server.roles.iter().map(|r| format!("{r:?}").to_lowercase()).collect::<Vec<_>>()},
         },
-        "compaction": {"enabled": effective.compaction.enabled, "trigger_packs": effective.compaction.trigger_packs, "trigger_bytes": effective.compaction.trigger_bytes.as_u64()},
+        "packs": {"enabled": effective.packs.enabled, "fold_when_fresh_packs_reach": effective.packs.fold_when_fresh_packs_reach, "fold_when_max_age_secs": effective.packs.fold_when_max_age.as_secs(), "segment_max_bytes": effective.packs.segment_max_bytes.as_u64(), "freeze_when_settled_secs": effective.packs.freeze_when_settled.as_secs()},
         // D33: what this repository follows and what the last round on this instance did.
         "upstream": {
             "git": effective.upstream.git,
@@ -342,51 +312,7 @@ fn describe_json(
     }))
 }
 
-/// "0 0 23 * * Sun" → "Sundays at 23:00 UTC"; "@hourly" → "every hour".
-fn human_schedule(expr: &str) -> String {
-    match expr.trim() {
-        "@hourly" => return "every hour, at :00 UTC".into(),
-        "@daily" | "@midnight" => return "every day at 00:00 UTC".into(),
-        "@weekly" => return "Sundays at 00:00 UTC".into(),
-        _ => {}
-    }
-    let f: Vec<&str> = expr.split_whitespace().collect();
-    if f.len() != 6 {
-        return expr.to_string();
-    }
-    let (sec, min, hour, dom, mon, dow) = (f[0], f[1], f[2], f[3], f[4], f[5]);
-    let hm = match (hour.parse::<u32>(), min.parse::<u32>()) {
-        (Ok(h), Ok(m)) => format!("at {h:02}:{m:02} UTC"),
-        _ if hour == "*" && min.parse::<u32>().is_ok() => {
-            format!("every hour at :{:02} UTC", min.parse::<u32>().unwrap())
-        }
-        _ => format!("at {hour}:{min}"),
-    };
-    let day = if dow != "*" && dow != "?" {
-        let lower = dow.to_ascii_lowercase();
-        let name = match lower.as_str() {
-            "0" | "7" | "sun" => "Sundays",
-            "1" | "mon" => "Mondays",
-            "2" | "tue" => "Tuesdays",
-            "3" | "wed" => "Wednesdays",
-            "4" | "thu" => "Thursdays",
-            "5" | "fri" => "Fridays",
-            "6" | "sat" => "Saturdays",
-            other => other,
-        };
-        name.to_string()
-    } else if dom != "*" && dom != "?" {
-        format!("day {dom} of the month")
-    } else if hour == "*" {
-        String::new()
-    } else {
-        "every day".to_string()
-    };
-    let _ = (sec, mon);
-    format!("{day} {hm}").trim().to_string()
-}
-
-/// `POST …/settings/validate` body = TOML: `{ok, errors[], strategies[], fields[]}` —
+/// `POST …/settings/validate` body = TOML: `{ok, errors[], fields[]}` —
 /// the describe of the *would-be* effective config, without publishing.
 pub async fn http_validate(
     st: &AppState,

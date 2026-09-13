@@ -5,6 +5,9 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+anyhow.workspace = true
+sha2.workspace = true
+hex.workspace = true
 prost.workspace = true
 bytes.workspace = true
 prost-types.workspace = true

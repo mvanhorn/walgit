@@ -1,3 +1,5 @@
+> Historical announcement. Its bundle delivery description predates the packfile migration; see [current design](PACKFILE_URI_DESIGN.md).
+
 # Announcing walgit: a git server that is one binary in front of a bucket
 
 *Draft announcement post. Publish alongside the repository.*
@@ -75,7 +77,7 @@ nix run github:tobi/walgit -- --config walgit.toml     # or: podman build -f Con
 ```
 
 The repository is at **github.com/tobi/walgit**, MIT licensed. `README.md` is the introduction; `AGENTS.md` is
-the architecture and the list of design decisions with their reasoning; `docs/BUNDLE_URI_DESIGN.md` is the bundle
+the architecture and the list of design decisions with their reasoning; `docs/PACKFILE_URI_DESIGN.md` is the current pack-delivery
 scheduler's design of record. The numbers we quote — 8-second CI clones, 32 GB of clone bytes with 2.8 MB through
 the server — come from the monorepo it was built for; the simulation suite (crashes, partitions, stale reads,
 lost responses) is how we keep the consistency story honest.

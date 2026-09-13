@@ -81,3 +81,27 @@ jobs:
       - name: Build the SPA and the SDK
         run: just web-build
       - run: just e2e
+      - run: just sim
+      - run: just smoke
+
+  spec:
+    name: bounded contract checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install spec runner dependencies
+        run: sudo apt-get update && sudo apt-get install -y ripgrep
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: just
+      - run: just spec
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: spec-evidence
+          path: target/test-logs/spec-*

@@ -190,65 +190,6 @@ impl LocalRepo {
         Ok(stats)
     }
 
-    /// A git bundle (`# v2 git bundle` header with `refs` and `-<prereq>`
-    /// lines, then the pack) written with this engine: the pack is exactly
-    /// "objects reachable from `refs` minus `prerequisites`", enumerated by
-    /// tree diff, so incremental bundles of a repository whose base is
-    /// linked/remote-served never walk the base's trees (stock `git bundle
-    /// create` marks every tree of the boundary commits uninteresting = reads
-    /// them all). `refs` are `(name, oid)`; prerequisites are commit ids the
-    /// consumer must already have. Returns the pack's object count and bytes.
-    pub async fn write_bundle_gix<W: AsyncWrite + Unpin + Send>(
-        &self,
-        mut out: W,
-        refs: &[(String, gix_hash::ObjectId)],
-        prerequisites: &[gix_hash::ObjectId],
-        faulter: Option<&dyn ObjectFaulter>,
-    ) -> Result<UploadPackStats, GitError> {
-        let mut header = String::from("# v2 git bundle\n");
-        for p in prerequisites {
-            {
-                let _ = std::fmt::Write::write_fmt(&mut header, format_args!("-{} \n", p.to_hex()));
-            };
-        }
-        for (name, oid) in refs {
-            {
-                let _ = std::fmt::Write::write_fmt(
-                    &mut header,
-                    format_args!("{} {name}\n", oid.to_hex()),
-                );
-            };
-        }
-        header.push('\n');
-        out.write_all(header.as_bytes())
-            .await
-            .map_err(GitError::Io)?;
-        let req = UploadPackRequest {
-            wants: refs.iter().map(|(_, o)| *o).collect(),
-            haves: prerequisites.to_vec(),
-            done: true,
-            thin_pack: false,
-            no_progress: true,
-            include_tag: false,
-            ofs_delta: true,
-            sideband_all: false,
-            wait_for_done: false,
-            filter: None,
-            deepen: None,
-            deepen_since: None,
-            deepen_not: vec![],
-            shallow: vec![],
-            want_refs: vec![],
-            packfile_uris_protocols: vec![],
-        };
-        // Prerequisites are known by definition (the bundle's consumer has them).
-        let common: Vec<gix_hash::ObjectId> = prerequisites.to_vec();
-        let mut sink = PackOut::Raw(out);
-        let stats = self.produce_pack(&req, &common, faulter, &mut sink).await?;
-        sink.finish().await?;
-        Ok(stats)
-    }
-
     /// Enumerate (retrying after faults) and stream the pack into `sink`.
     async fn produce_pack<W: AsyncWrite + Unpin + Send>(
         &self,
@@ -476,7 +417,6 @@ enum PackOut<W: AsyncWrite + Unpin + Send> {
         sb_all: bool,
         progress: bool,
     },
-    Raw(W),
 }
 
 impl<W: AsyncWrite + Unpin + Send> PackOut<W> {
@@ -488,13 +428,11 @@ impl<W: AsyncWrite + Unpin + Send> PackOut<W> {
                 let _ = sb.write_progress(text.as_bytes()).await;
             }
             PackOut::Sideband { .. } => {}
-            PackOut::Raw(_) => {
-                tracing::debug!(target: "walgit_git::upload_gix", "{}", text.trim_end());
-            }
         }
     }
     async fn begin_pack(&mut self) -> Result<(), GitError> {
-        if let PackOut::Sideband { sb, sb_all, .. } = self {
+        let PackOut::Sideband { sb, sb_all, .. } = self;
+        {
             let mut pf = Vec::with_capacity(16);
             line(&mut pf, b"packfile\n", *sb_all);
             sb.inner_mut().write_all(&pf).await.map_err(GitError::Io)?;
@@ -504,13 +442,11 @@ impl<W: AsyncWrite + Unpin + Send> PackOut<W> {
     async fn data(&mut self, chunk: &[u8]) -> Result<(), GitError> {
         match self {
             PackOut::Sideband { sb, .. } => sb.write_data(chunk).await,
-            PackOut::Raw(w) => w.write_all(chunk).await.map_err(GitError::Io),
         }
     }
     async fn finish(&mut self) -> Result<(), GitError> {
         match self {
             PackOut::Sideband { sb, .. } => sb.flush().await,
-            PackOut::Raw(w) => w.flush().await.map_err(GitError::Io),
         }
     }
 }

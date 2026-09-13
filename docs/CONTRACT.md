@@ -5,11 +5,9 @@ crates in parallel)**, kept as the reference for names and shapes. Rule still in
 — a type or function listed here is relied on by another crate. **Where this file and the code disagree, the
 code is right and this file is stale**; verify with `rg`/`cargo doc` before relying on a signature. Known
 supersessions (2026-08-20 sweep): `RepoHandle::sync()` is now the *Serve* level of the sync-level family
-(`sync_refs` / `sync` = Serve / `sync_full` / `sync_objects`, `AGENTS.md §2.3`); auth is Google identities only
-(`AGENTS.md §1.3`, no "admin token"); the server router is `web/API.md` + `AGENTS.md D15/D20/D26/D27`; bundle
-schedule/retention semantics are specified only by `docs/BUNDLE_URI_DESIGN.md §3–§4` (calendar slots,
-slot-epoch tokens, contiguous-chain retention, main-only refs). Read when you touch a crate boundary; update
-the relevant block when you extend one.
+(`sync_refs` / `sync` = Serve / `sync_full` / `sync_objects`, `AGENTS.md §2.3`); auth is none/token/oidc
+(`AGENTS.md §1.3`, with explicit admin principals); the server router is `web/API.md` + `AGENTS.md D15/D20/D26/D27`; the packfile replacement target is [PACKFILE_URI_DESIGN.md](PACKFILE_URI_DESIGN.md).
+Runtime bundle contracts are removed; retained protobuf messages exist only for durable replay.
 
 Shared interfaces between crates. Implement exactly these names/shapes; extend freely, do not rename.
 Original owners (parallel batch): StoreS3, StoreGcs, StoreCoord, GitEngine, Wal, Server, Bundle, Cli.
@@ -25,7 +23,9 @@ Read `AGENTS.md` first (design §1–§2, decisions §3; the original layout/pha
   `ObjectStoreExt`, `Prefixed`, `memory::MemoryStore`, `util::{collect,once,file_stream,backoff,retry}`),
   placeholder modules `coord.rs`, `gcs.rs`, `s3.rs`.
 - `walgit-config`: `Config` for walgit.toml (+ `WALGIT__` env overrides, `PORT`); `Config::with_settings` accepts
-  only `[bundles]`, `[maintenance]`, `[compaction]` and `[upstream]` in repo-scoped settings.
+  only `[maintenance]`, `[packs]`, `[upstream]`, `[refs]` and `[packfile_uri]` in repo-scoped settings.
+  `PacksConfig` owns lifecycle thresholds and whole-operation memory budgets; removed compaction keys are
+  rejected on host/new-write paths. Durable-only transition rules live in `PACKFILE_MIGRATION.md`.
 
 ## walgit-git (owner: GitEngine)
 
@@ -103,17 +103,11 @@ impl LocalRepo {
   pub struct RepackOptions { pub mode: RepackMode /* Geometric{factor} | Full */, pub write_bitmap: bool,
       pub write_midx: bool, pub keep: Vec<gix_hash::ObjectId> }
   pub struct RepackResult { pub new_packs: Vec<PackInfo>, pub removed: Vec<gix_hash::ObjectId> }
-  /// `git bundle create`.
-  pub async fn write_bundle(&self, out: &Path, refs: &[String], exclude: &[gix_hash::ObjectId])
-      -> Result<BundleInfo, GitError>;
-  pub struct BundleInfo { pub size: u64, pub pack_offset: u64 }
+
 }
-/// Bundle header ("# v2 git bundle\n" [+ "-<oid> prereq\n"]* + "<oid> <ref>\n"* + "\n") so a full bundle
-/// can be rendered as header + existing pack bytes without git.
-pub fn bundle_header(refs: &RefSnapshotData, prerequisites: &[gix_hash::ObjectId], format: ObjectFormat) -> Vec<u8>;
 
 pub mod pkt;      // pkt-line read/write, flush/delim/response-end, sideband encode; Protocol::{V0,V2} from
-                  // GIT_PROTOCOL header; command/arg parsing for v2 (ls-refs, fetch, object-info, bundle-uri)
+                  // GIT_PROTOCOL header; command/arg parsing for v2 (ls-refs, fetch, object-info)
 pub mod receive;  // parse receive-pack request: caps + commands ("old new refname\0caps"), push-options,
                   // => (walgit_proto::v1::RefTransaction, ReceiveCaps{report_status_v2, side_band_64k,
                   // atomic, quiet, push_options, agent, object_format}); pack bytes follow in the same body.
@@ -245,7 +239,7 @@ pub enum RefError { NonFastForward, Conflict{expected,actual}, Rejected(String),
 
 ```rust
 pub struct AppState { pub cfg: Arc<Config>, pub store: DynStore, pub registry: Arc<walgit_wal::Registry>,
-                      pub bundles: Arc<walgit_bundle::Bundler>, pub auth: Arc<auth::Authenticator> }
+                      pub auth: Arc<auth::Authenticator> }
 pub fn router(state: Arc<AppState>) -> axum::Router;
 /// Bind, serve (HTTP/1.1 + h2c), graceful shutdown on SIGTERM/SIGINT/`shutdown` future.
 pub async fn serve(state: Arc<AppState>, shutdown: impl Future<Output=()> + Send) -> anyhow::Result<()>;
@@ -254,7 +248,6 @@ pub async fn serve(state: Arc<AppState>, shutdown: impl Future<Output=()> + Send
 //   POST /git-upload-pack   POST /git-receive-pack   (Content-Encoding: gzip supported; streaming both ways)
 //   GET  /HEAD  GET /objects/info/packs (404 unless dumb enabled)
 //   POST /info/lfs/objects/batch  PUT/GET /info/lfs/objects/{oid}  POST /info/lfs/verify
-//   GET  /bundles/list  GET /bundles/{strategy}/{name}    (bundle-uri targets; ETag/Range/immutable caching)
 //   POST /api/ops/snapshot?at_seq=N  GET /api/snapshot/{seq}   (WAL time travel; non-mutating, per instance)
 //   PUT  /  (create repo, write permission)   DELETE / (write permission)
 // Non-repo: GET /healthz /readyz /metrics ; GET / (list repos, text/plain)
@@ -262,54 +255,8 @@ pub async fn serve(state: Arc<AppState>, shutdown: impl Future<Output=()> + Send
 // (Refs, Serve, Full, or Objects; AGENTS.md §2.3).
 ```
 
-## walgit-bundle (owner: Bundle)
-
-```rust
-pub struct Bundler; impl Bundler {
-  pub fn new(registry: Arc<Registry>, cfg: Arc<Config>) -> Arc<Self>;
-  /// Evaluate all strategies for `id` at `now`; build those due (leased per repo+strategy), upload
-  /// bundles/<strategy>/<ts>-<sha>.bundle, cas_update bundles/list.pb, prune keep=N. Returns built entries.
-  pub async fn run_due(&self, id: &RepoId, now: SystemTime) -> Result<Vec<BundleEntry>, BundleError>;
-  pub async fn build(&self, id: &RepoId, strategy: &str) -> Result<BundleEntry, BundleError>;
-  pub async fn list(&self, id: &RepoId) -> Result<Option<BundleList>, BundleError>;
-  /// git bundle-list text (bundle.version=1, bundle.mode, bundle.heuristic=creationToken, bundle.<id>.uri/
-  /// creationToken); uri = `{base_url}/{owner}/{repo}/bundles/{strategy}/{name}` or signed URL per config.
-  pub async fn render_list(&self, id: &RepoId, base_url: &str) -> Result<Option<String>, BundleError>;
-  /// v2 `bundle-uri` command response lines (key=value pkt-lines).
-  pub async fn protocol_v2_lines(&self, id, base_url) -> Result<Vec<String>, BundleError>;
-  pub async fn run_all_due(&self, now) -> Result<(), BundleError>; // every repo in registry.list()
-}
-
-/// Abstraction over the registry; `walgit_wal::Registry` implements it and tests may use any impl.
-#[async_trait]
-pub trait BundleSource: Send + Sync + 'static {
-  async fn open_repo(&self, id: &RepoId) -> Result<BundleRepoHandle, BundleError>;
-  async fn list_repos(&self) -> Result<Vec<RepoId>, BundleError>;
-}
-pub struct BundleRepoHandle {
-  pub local: walgit_git::LocalRepo,
-  pub store: walgit_store::Prefixed,
-  pub head_seq: u64,
-}
-/// `Bundler::new_with_source(source: Arc<dyn BundleSource>, cfg)` accepts custom sources;
-/// `Bundler::new(registry: Arc<Registry>, cfg)` delegates to it.
-pub use walgit_git::RepoId; // re-exported
-pub enum BundleError { Store, Decode, Git, StrategyNotFound, RepoNotFound, InvalidRepoId,
-  InvalidSchedule, Io, BundleNotFound, NoRefs, NoNewObjects, RetriesExhausted, Other }
-```
-
-### Proto addition (owner: Bundle)
-`BundleEntry` gains `repeated Ref tips = 11;` — the ref tips (name+oid+peeled) a
-bundle contains. For incremental bundles, the base bundle's tips are the
-prerequisites. Backward compatible (field 11 was unused).
-
-### Schedule / retention semantics
-Normative rules live in `docs/BUNDLE_URI_DESIGN.md §3–§4`: six-field UTC calendar slots, WAL state as of each
-slot, slot-epoch creation tokens, oldest-first backfill, contiguous-chain retention, and main-only selection
-where configured. Do not derive scheduling behavior from this interface catalog.
-
 ## walgit-cli (owner: Cli)
-`walgit --config walgit.toml <cmd>`: `serve` | `compact [owner/name|--all] [--once]` | `bundle run [--repo] [--strategy]` |
+`walgit --config walgit.toml <cmd>`: `serve` | `compact [owner/name|--all] [--once]` |
 `repo create|list|info` | `wal ls|show|materialize --at-seq` | `synth --out DIR --size s|m|l [--commits N --files M]`
 | `import --from GITDIR owner/name` | `config check|dump`. Also `Containerfile`, `compose.yaml` (rustfs +
 walgit), `justfile`, `walgit.example.toml`, `tests/e2e.sh` (real git vs. server on memory store and on rustfs).

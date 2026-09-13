@@ -177,7 +177,7 @@ export interface OpSpec {
 }
 export interface OpRecord {
   id: string;
-  /** The task kind (fsck, compact, bundle, checkpoint, materialize, …) — the wire field is `kind`. */
+  /** The task kind (fsck, compact, checkpoint, materialize, …) — the wire field is `kind`. */
   kind: string;
   repo: string;
   hostname: string;
@@ -199,7 +199,7 @@ export type Overview = Record<string, unknown> & {
   clone_url: string;
   hostname: string;
   health: { status: "ok" | "degraded" | "error"; issues: string[]; deep: string };
-  ops: { available: OpSpec[]; recent: OpRecord[]; bundle_strategies: string[] };
+  ops: { available: OpSpec[]; recent: OpRecord[] };
 };
 /** One `/policy` document (docs/POLICY.md). */
 export type Policy = Record<string, unknown>;
@@ -761,7 +761,7 @@ export class RepoClient {
       }),
   };
 
-  /** D24: WAL-backed TOML overrides of [bundles], [maintenance], [compaction] and [upstream]. */
+  /** WAL-backed TOML overrides, including ref/group and pack delivery policy. */
   readonly settings = {
     /** The settings document (`revision: 0` = none). */
     get: (opts?: CallOptions) => this.client.json<RepoSettings>(`${this.p}/settings`, opts),
@@ -778,7 +778,7 @@ export class RepoClient {
     effective: (opts?: CallOptions) => this.client.text(`${this.p}/settings/effective`, opts),
     /** SETTINGS entries in the live log, oldest first. */
     history: (opts?: CallOptions) => this.client.json<SettingsHistory>(`${this.p}/settings/history`, opts),
-    /** Everything the Settings tab shows: strategies with next fire, placement, fields with sources. */
+    /** Effective placement and configuration fields with their sources. */
     describe: (opts?: CallOptions) => this.client.json<SettingsDescribe>(`${this.p}/settings/describe`, opts),
     /** Validate a document and preview the resulting effective config, without publishing. */
     validate: (toml: string, opts?: CallOptions) =>
@@ -801,21 +801,6 @@ export interface SettingsHistory {
   min_seq: number;
   entries: { seq: number; revision: number; author: string; message: string; at: string | null; toml: string }[];
 }
-export interface StrategyInfo {
-  name: string;
-  kind: "full" | "incremental";
-  base: string | null;
-  schedule: string;
-  schedule_human: string;
-  next: string | null;
-  keep: number;
-  backfill_max: number;
-  min_commits: number;
-  refs: string[];
-  /** Incrementals: cut on this strategy's previous bundle (chained) instead of the base's newest. */
-  chain: boolean;
-  filter: string | null;
-}
 export interface SettingsField {
   key: string;
   value: unknown;
@@ -826,14 +811,12 @@ export interface SettingsDescribe {
   repo: string;
   settings: RepoSettings | { revision: 0; toml: "" };
   sections: string[];
-  strategies: StrategyInfo[];
-  bundles: { enabled: boolean; min_commits: number; main_only: boolean };
   maintenance: {
     checkpoints: boolean;
     interval_secs: number;
     this_host: { name: string; serves: boolean; maintains: boolean; disk: string; max_pack_bytes: number; cache_budget_bytes: number; roles: string[] };
   };
-  compaction: { enabled: boolean; trigger_packs: number; trigger_bytes: number };
+  packs: { enabled: boolean; fold_when_fresh_packs_reach: number; fold_when_max_age_secs: number; segment_max_bytes: number; freeze_when_settled_secs: number };
   /** D33: what this repository follows (`[upstream] follow`) and the last round on the answering instance. */
   upstream: {
     git: string | null;

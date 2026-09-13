@@ -1,9 +1,15 @@
 //! Local git repository engine: gix in-process for odb/refs/revwalk/pack
 //! generation; upstream git subprocess for ingest (`index-pack`), repack,
-//! bundle, and the selectable `Engine::Git` upload-pack fallback. See AGENTS.md
+//! and the selectable `Engine::Git` upload-pack fallback. See AGENTS.md
 //! D2 and docs/CONTRACT.md walgit-git.
 
 pub mod follow;
+pub mod maintenance_input;
+pub mod midx;
+pub mod object_links;
+pub mod pack_groups;
+pub mod pack_segments;
+pub mod packfile_uri;
 pub mod pkt;
 pub mod receive;
 pub mod repair;
@@ -424,7 +430,7 @@ impl Service {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 #[expect(
     clippy::struct_excessive_bools,
     reason = "Independent Git protocol capabilities and request flags"
@@ -446,6 +452,7 @@ pub struct UploadPackRequest {
     pub shallow: Vec<gix_hash::ObjectId>,
     pub want_refs: Vec<String>,
     pub packfile_uris_protocols: Vec<String>,
+    pub packfile_indexes: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -472,12 +479,6 @@ pub struct RepackOptions {
 pub struct RepackResult {
     pub new_packs: Vec<PackInfo>,
     pub removed: Vec<gix_hash::ObjectId>,
-}
-
-#[derive(Debug, Clone)]
-pub struct BundleInfo {
-    pub size: u64,
-    pub pack_offset: u64,
 }
 
 /// Outcome of [`LocalRepo::fsck_streaming`].
@@ -563,6 +564,8 @@ struct Inner {
     refs_gen: std::sync::atomic::AtomicU64,
     /// How often `packed-refs` + loose refs were parsed (tests assert pushes do not add to it).
     refs_parses: std::sync::atomic::AtomicU64,
+    /// Disposable serving mode selected from the committed manifest by sync.
+    segmented_midx: std::sync::atomic::AtomicBool,
 }
 
 #[derive(Clone)]
@@ -653,6 +656,7 @@ impl LocalRepo {
                 refs_cache: parking_lot::Mutex::new(None),
                 refs_gen: std::sync::atomic::AtomicU64::new(0),
                 refs_parses: std::sync::atomic::AtomicU64::new(0),
+                segmented_midx: std::sync::atomic::AtomicBool::new(false),
             }),
         })
     }
@@ -678,6 +682,7 @@ impl LocalRepo {
                 refs_cache: parking_lot::Mutex::new(None),
                 refs_gen: std::sync::atomic::AtomicU64::new(0),
                 refs_parses: std::sync::atomic::AtomicU64::new(0),
+                segmented_midx: std::sync::atomic::AtomicBool::new(false),
             }),
         }))
     }
@@ -969,6 +974,13 @@ impl LocalRepo {
         let hex = checksum.to_hex();
         let pack_dir = self.objects_pack_dir();
         let was_history = pack_dir.join(format!("pack-{hex}.history")).exists();
+        if self
+            .inner
+            .segmented_midx
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            self.invalidate_midx()?;
+        }
         for ext in ["pack", "idx", "rev", "bitmap", "commit-graph", "history"] {
             let p = pack_dir.join(format!("pack-{hex}.{ext}"));
             match std::fs::remove_file(&p) {
@@ -1916,8 +1928,20 @@ impl LocalRepo {
 
     /// v0 advertisement with capabilities. The HTTP server prepends the
     /// `# service=<svc>\n` pkt-line + flush.
-    pub fn advertise_refs_v0(&self, service: Service, out: &mut Vec<u8>) -> Result<(), GitError> {
-        let snap = self.refs()?;
+    pub fn advertise_refs_v0(
+        &self,
+        service: Service,
+        out: &mut Vec<u8>,
+        selectors: Option<&[String]>,
+    ) -> Result<(), GitError> {
+        let mut snap = self.refs()?;
+        if service == Service::UploadPack
+            && let Some(selectors) = selectors
+        {
+            snap.refs.retain(|r| {
+                walgit_config::refs::selectors_match(selectors, &r.name, &snap.head_target)
+            });
+        }
         let caps = capabilities_for(service, self.inner.format);
         let caps_line = format!("\0{caps}\n");
 
@@ -2243,6 +2267,13 @@ impl LocalRepo {
     }
 
     fn write_history_midx_blocking(&self) -> Result<(), GitError> {
+        if self
+            .inner
+            .segmented_midx
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Ok(());
+        }
         // The midx covers the history pack(s) **and their bases** (when the
         // base idx is installed: linked or local), history first as the
         // preferred pack: an object in both resolves to the history pack, and
@@ -2454,43 +2485,6 @@ impl LocalRepo {
         }
         self.refresh_async().await?;
         Ok(())
-    }
-
-    pub async fn write_bundle(
-        &self,
-        out: &Path,
-        refs: &[String],
-        exclude: &[gix_hash::ObjectId],
-    ) -> Result<BundleInfo, GitError> {
-        // Build rev args fed to `git bundle create <out> --stdin`.
-        let mut input = String::new();
-        for r in refs {
-            input.push_str(r);
-            input.push('\n');
-        }
-        for e in exclude {
-            input.push('^');
-            input.push_str(&e.to_hex().to_string());
-            input.push('\n');
-        }
-        let out_str = out.to_string_lossy().to_string();
-        let bundle_out = self
-            .run_git_stdin(
-                "bundle",
-                &["create", out_str.as_str(), "--stdin"],
-                input.as_bytes(),
-            )
-            .await?;
-        if !bundle_out.status.success() {
-            return Err(GitError::Subprocess {
-                cmd: "git bundle create".into(),
-                status: bundle_out.status.code(),
-                stderr: String::from_utf8_lossy(&bundle_out.stderr).into_owned(),
-            });
-        }
-        let size = std::fs::metadata(out).map_or(0, |m| m.len());
-        let pack_offset = locate_pack_offset(out).unwrap_or(size);
-        Ok(BundleInfo { size, pack_offset })
     }
 
     /// Full `git fsck` of the local copy, streaming every output line (stdout
@@ -2707,30 +2701,6 @@ impl LocalRepo {
 // ---------------------------------------------------------------------------
 // Free functions
 // ---------------------------------------------------------------------------
-
-/// Render a git bundle v2 header from a ref snapshot and prerequisites, so a
-/// full bundle can be assembled as header + existing pack bytes without git.
-pub fn bundle_header(
-    refs: &RefSnapshotData,
-    prerequisites: &[gix_hash::ObjectId],
-    format: ObjectFormat,
-) -> Vec<u8> {
-    let mut out = Vec::new();
-    out.extend_from_slice(b"# v2 git bundle\n");
-    for p in prerequisites {
-        out.extend_from_slice(p.to_hex().to_string().as_bytes());
-        out.extend_from_slice(b" \n");
-    }
-    for r in &refs.refs {
-        out.extend_from_slice(r.oid.as_bytes());
-        out.push(b' ');
-        out.extend_from_slice(r.name.as_bytes());
-        out.push(b'\n');
-    }
-    out.push(b'\n');
-    let _ = format;
-    out
-}
 
 // ---------------------------------------------------------------------------
 // Internals
@@ -3177,6 +3147,15 @@ fn peel_tag(repo: &gix::Repository, oid: gix_hash::ObjectId) -> Option<gix_hash:
 pub fn build_v2_fetch_request(req: &UploadPackRequest) -> Vec<u8> {
     let mut buf = Vec::new();
     pkt::encode_data(&mut buf, b"command=fetch\n");
+    if req
+        .wants
+        .first()
+        .or(req.haves.first())
+        .or(req.shallow.first())
+        .is_some_and(|oid| oid.kind() == gix_hash::Kind::Sha256)
+    {
+        pkt::encode_data(&mut buf, b"object-format=sha256\n");
+    }
     // Git protocol v2 carries all fetch features (thin-pack, want, have, ...)
     // as arguments following the delim-pkt; there is no pre-delim capability
     // section for fetch.
@@ -3224,7 +3203,7 @@ pub fn build_v2_fetch_request(req: &UploadPackRequest) -> Vec<u8> {
         pkt::encode_data(&mut buf, format!("want-ref {r}\n").as_bytes());
     }
     if !req.packfile_uris_protocols.is_empty() {
-        let joined = req.packfile_uris_protocols.join(" ");
+        let joined = req.packfile_uris_protocols.join(",");
         pkt::encode_data(&mut buf, format!("packfile-uris {joined}\n").as_bytes());
     }
     if req.done {
@@ -3232,33 +3211,6 @@ pub fn build_v2_fetch_request(req: &UploadPackRequest) -> Vec<u8> {
     }
     pkt::encode_flush(&mut buf);
     buf
-}
-
-fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack.windows(needle.len()).position(|w| w == needle)
-}
-
-fn locate_pack_offset(path: &Path) -> Option<u64> {
-    use std::io::{Read, Seek, SeekFrom};
-    let mut f = std::fs::File::open(path).ok()?;
-    // The pack payload starts with the literal "PACK". Scan the file head.
-    let mut buf = vec![0u8; 8 * 1024];
-    let mut pos = 0u64;
-    loop {
-        let n = f.read(&mut buf).ok()?;
-        if n == 0 {
-            return None;
-        }
-        if let Some(i) = find_subsequence(buf.get(..n)?, b"PACK") {
-            return Some(pos + i as u64);
-        }
-        // Seek back a little to handle boundary splits.
-        if n < buf.len() {
-            return None;
-        }
-        pos += n as u64 - 3;
-        f.seek(SeekFrom::Start(pos)).ok()?;
-    }
 }
 
 // ---------------------------------------------------------------------------

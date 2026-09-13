@@ -31,9 +31,21 @@ pub fn cursor(b: Vec<u8>) -> std::io::Cursor<Vec<u8>> {
 impl SourceRepo {
     /// Create a source repo with one initial commit (`file1`).
     pub fn new() -> Self {
+        Self::with_object_format("sha1")
+    }
+
+    pub fn with_object_format(format: &str) -> Self {
         let tmp = TempDir::new().expect("tmpdir");
         let dir = tmp.path().to_path_buf();
-        run_git(&dir, &["init", "-q", dir.to_str().unwrap()]);
+        run_git(
+            &dir,
+            &[
+                "init",
+                "-q",
+                &format!("--object-format={format}"),
+                dir.to_str().unwrap(),
+            ],
+        );
         run_git(&dir, &["config", "user.email", "t@t"]);
         run_git(&dir, &["config", "user.name", "t"]);
         run_git(&dir, &["config", "commit.gpgsign", "false"]);

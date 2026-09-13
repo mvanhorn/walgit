@@ -134,7 +134,7 @@ export function ApiPage() {
               desc={<>Per-repository settings in the WAL (<code>GET</code> read; <code>PUT</code>/<code>DELETE</code> admin); also <code>/effective</code>, <code>/history</code>, <code>/describe</code> and <code>POST /validate</code>.</>}
               cache="no-store"
             />
-            <Row path={`/${r}/api/overview`} desc="WAL health, manifest, packs, bundles (what the WAL tab shows)." cache="no-store" />
+            <Row path={`/${r}/api/overview`} desc="WAL health, manifest, packs (what the WAL tab shows)." cache="no-store" />
             <Row
               path={`/${r}/api/tasks · /tasks/{id} · POST /ops/{op}`}
               desc={<>What the answering instance is doing to the repo (<code>{`{hostname,running,recent}`}</code>); attach to a task or start a maintenance op (write) as an SSE stream.</>}

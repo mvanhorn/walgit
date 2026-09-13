@@ -1,8 +1,7 @@
 # walgit — a git server that is one binary in front of an object store
 
 walgit hosts git repositories with **no database, no leader and no local state that matters**. You run a
-single binary, point it at an S3 or GCS bucket, and you have: smart HTTP (v0/v2) fetch and push, `bundle-uri`
-clones served as static files, Git LFS, a browsing web UI, a JSON API with an SDK, per-repository push policy,
+single binary, point it at an S3 or GCS bucket, and you have: smart HTTP (v0/v2) fetch and push, Git LFS, a browsing web UI, a JSON API with an SDK, per-repository push policy,
 webhooks — and a server that scales to repositories **larger than the machine it runs on**. Every machine that
 runs walgit is a disposable cache; the bucket is the repository.
 
@@ -63,21 +62,25 @@ WAL is the truth, there is complete provenance: every push and every repack, rep
 
 walgit takes that as-is, and adds what a *monorepo on small machines* needs: serving refs and web pages for a
 repository whose packs will never fit on the instance (a **remote reader** over HTTP range requests), keeping
-commits and trees local while blobs stay in the bucket (the **history pack**), and moving clone bytes out of the
-server entirely (**bundle-uri**: fresh clones and catch-ups are static files the bucket or a CDN hands out).
+commits and trees local while blobs stay in the bucket (the **history pack**).
+
+**Packfile migration:** bundle runtime has been removed. Native Git can deliver proven reusable packs plus
+the uncovered graph for anonymous-read repositories. Protected repositories and remote/gix serving use
+dynamic upload-pack; protected URI clients and large-repository performance remain release gates.
+Read the [design](docs/PACKFILE_URI_DESIGN.md) and
+[migration guide](docs/PACKFILE_MIGRATION.md), especially saved settings and existing client catch-up config.
 
 ## What it does
 
 | | |
 |---|---|
-| **git** | smart HTTP v0/v2: `ls-refs` with prefixes, fetch with filter/shallow/deepen/sideband-all, receive-pack (atomic, deletes, tags, push options, report-status-v2), `<owner>/<repo>` namespaces, sha1 and sha256 repositories. Upstream `git` does upload-pack/repack/bundle; walgit does receive-pack, the WAL and the plumbing. |
-| **bundle-uri** | Bundles cut on calendar slots (weekly full, chained dailies, hourlies) as a pure function of the WAL: a fresh clone downloads the newest full plus the chain above it from the bucket and asks the server only for the remainder; a catch-up downloads exactly the slots it missed. Two lists per repo: `bundles/list` for clones, `bundles/catchup` for fetches. Blobless families for `--filter=blob:none`. |
+| **git** | smart HTTP v0/v2: `ls-refs` with prefixes, fetch with filter/shallow/deepen/sideband-all, receive-pack (atomic, deletes, tags, push options, report-status-v2), `<owner>/<repo>` namespaces, sha1 and sha256 repositories. Upstream `git` does upload-pack/repack; walgit does receive-pack, the WAL and the plumbing. |
 | **LFS** | Batch API + basic transfer, objects in the bucket, optional read-through from an upstream LFS server for imported repositories. |
 | **web UI + API** | A React UI (tree, blob, commits, diffs, the WAL's own health page) on a read-mostly JSON API under `/{owner}/{repo}/api/*`; sha-addressed answers are immutable and cached everywhere; long answers stream progress as SSE. `repos.js` is a dependency-free SDK for pages, agents and scripts. |
 | **policy** | Per-repository push rules (`policy.json`): protected refs, groups, fast-forward only, bypass lists. `docs/POLICY.md`. |
-| **settings** | Per-repository config (bundle schedules, compaction, upstream follow) published into the WAL with history. |
+| **settings** | Per-repository config (maintenance, compaction, upstream follow) published into the WAL with history. |
 | **events** | A small bridge tails the WAL and POSTs ref events to a webhook, exactly-once per (repo, seq, ref) with a durable cursor. `docs/EVENTS.md`. |
-| **maintenance** | Checkpoints, bundle builds, geometric compaction, base rebuilds, connectivity audits and repairs — one loop that computes the desired state from (config, WAL) every pass and does one bounded unit of the most important missing work. Self-healing by construction: an outage leaves no holes; a deleted artefact is "missing" and rebuilt identically. |
+| **maintenance** | Checkpoints, geometric compaction, connectivity audits and repairs — one loop that computes the desired state from (config, WAL) every pass and does one bounded unit of the most important missing work. Manual `compact --base` rebuilds the base on a host with sufficient disk. |
 | **auth** | `none` (loopback), `token` (static tokens), `oidc` (any OpenID Connect issuer: browser sign-in, ID tokens, and walgit-issued access tokens for git). `/services/public/install.sh` sets a developer's machine up in one idempotent command. |
 | **stores** | S3 and S3-compatible (AWS, MinIO, rustfs, R2, Ceph, …) and GCS, first class; an in-memory store for tests. |
 
@@ -87,7 +90,7 @@ server entirely (**bundle-uri**: fresh clones and catch-ups are static files the
 head sequence, the live pack set, checkpoint pointer, settings — *the linearization point*), `log/<seq>.pb`
 (immutable entries: PUSH, COMPACT, CHECKPOINT, SETTINGS), `wal/<checksum>.pack|.idx|.rev|.bitmap|.commit-graph`
 (immutable, content-addressed packs with their side-files), `checkpoints/<seq>/` (folded ref snapshot + pack
-inventory so a cold start is snapshot + tail), `bundles/`, `leases/` (CAS with TTL — the only cross-instance
+inventory so a cold start is snapshot + tail), `leases/` (CAS with TTL — the only cross-instance
 mutex), `policy.json`, `lfs/objects/`, `events/cursor.json`.
 
 **A push**: our receive-pack indexes the pack (`git index-pack --fix-thin --rev-index` in a scratch dir), checks
@@ -97,7 +100,7 @@ committed into one CAS. The client sees `ok` only after the bucket does.
 
 **A read**: one conditional GET of the manifest; 304 → serve from the local copy, 200 → apply the new entries.
 What "apply" means depends on what the request needs: **refs** (snapshot + log → `packed-refs`, no packs:
-advertisements, the API, bundle lists), **serve** (the pack set *as this machine can hold it*: small packs and the
+advertisements, the API), **serve** (the pack set *as this machine can hold it*: small packs and the
 history pack local, a too-large base read by range), **full** (everything local, for repacks), **objects** (the
 remote reader, for the UI on a repository that does not fit). Pack downloads run on their own runtime and never
 block a refs request.
@@ -129,10 +132,10 @@ open https://walgit.localhost:8080/
 * `walgit.example.toml` — every key with its default and a comment.
 * `Containerfile`, `flake.nix` — an OCI image and a Nix package/devshell.
 * `deploy/nginx.conf.example` — an optional nginx in front: public TLS, one `auth_request` per credential, and
-  **byte offload**: walgit answers bundle/LFS downloads with `X-Accel-Redirect` and nginx streams + caches the
+  **byte offload**: walgit answers LFS downloads with `X-Accel-Redirect` and nginx streams + caches the
   object from the bucket itself (S3 presigned or GCS with walgit's bearer). The file documents the contract.
 
-Roles (`server.roles`): `serve` (git, API, UI, bundles, LFS), `maintain` (checkpoints, bundles, compaction,
+Roles (`server.roles`): `serve` (git, API, UI, LFS), `maintain` (checkpoints, compaction,
 fsck/repair), `events` (the webhook bridge). Empty = all. Any number of `serve` hosts may point at one bucket; give
 each repository one maintainer (placement globs) and you are done.
 
@@ -147,7 +150,7 @@ each repository one maintainer (placement globs) and you are done.
 Developer setup is one idempotent command — `sh -c "$(curl -fsSL 'https://git.example.com/services/public/install.sh')"` —
 which stores the token in a file only the user can read, installs a tiny git credential helper (git ≥ 2.46: it
 answers `get` with `authtype=Bearer`, and on a real 401 `erase`s the token and says where a new one comes from),
-and turns on `transfer.bundleURI`. `?repo=owner/name` clones right after.
+and configures HTTPS URI negotiation. `?repo=owner/name` clones right after.
 
 ### Developing
 
@@ -169,20 +172,19 @@ crates/
   walgit-store    ObjectStore trait (CAS versions, conditional GET, range, compose); backends s3, gcs, memory; leases
   walgit-git      bare repos on disk, receive-pack, pack ingest, refs ↔ packed-refs, advertisements, upload-pack drivers
   walgit-wal      RepoHandle: sync levels, publish (group commit + CAS), checkpoints, log reader, remote reader, tasks
-  walgit-bundle   bundle-uri: slots and chains, building, header ∘ pack composition, lists, retention
-  walgit-server   axum: smart HTTP, LFS, bundles, auth (none/token/oidc), the maintainer loop, upstream follow,
+  walgit-server   axum: smart HTTP, LFS, auth (none/token/oidc), the maintainer loop, upstream follow,
                   web/ (API, UI, SDK routes, SSE), setup.rs (installer + recipes), events bridge
   walgit-config   walgit.toml (+ WALGIT__ env overrides), per-repo settings merge, fail-closed validation
-  walgit-cli      `walgit serve|import|compact|bundle|wal|mirror|synth|config|repo`; `walgit-server` = `walgit serve`
+  walgit-cli      `walgit serve|import|compact|wal|mirror|synth|config|repo`; `walgit-server` = `walgit serve`
 web/              React SPA (Vite) + sdk/repos.ts, built into the binary; the wire contract is web/API.md
-docs/             BUNDLE_URI_DESIGN, ROUNDTRIPS (the cost model), POLICY, LFS, INTEGRITY, EVENTS, CONTRACT, patches/
+docs/             PACKFILE_URI_DESIGN (target), PACKFILE_MIGRATION, ROUNDTRIPS (the cost model), POLICY, LFS, INTEGRITY, EVENTS, CONTRACT
 ```
 
 ## Invariants worth memorising
 
 * The manifest CAS is the only commit point; everything before it is invisible, everything after it is
   idempotent and replayable.
-* Immutable objects are content-addressed; nothing is overwritten except the manifest, the bundle list and leases.
+* Immutable objects are content-addressed; mutable control objects are explicitly named in `AGENTS.md` (manifest, leases, settings-related control and caches).
 * Every read revalidates against the bucket first; there is no "eventually".
 * Local disk is a cache. Memory is a cache. The bucket is the repository.
 * Placement is configured, never inferred; refs-level reads work everywhere, object work only where placed.

@@ -32,13 +32,17 @@ pub enum WalError {
     Invalid(String),
     #[error("retry exhausted after {attempts} attempts")]
     Retry { attempts: u32 },
+    /// The CAS may have committed or may still land. Absence of evidence is
+    /// not a definite rejection and must never become report-status `ng`.
+    #[error("commit outcome unknown: {0}")]
+    CommitUnknown(String),
     #[error(transparent)]
     Io(#[from] std::io::Error),
     /// The live pack set does not fit this instance's cache (`cache.max_bytes`);
     /// refs-level operations still work, object access must go elsewhere
     /// (bundle-uri, a disk-backed backend).
     #[error(
-        "repository pack set is {bytes} bytes, larger than this instance's cache limit ({max} bytes); clone via bundle-uri"
+        "repository pack set is {bytes} bytes, larger than this instance's cache limit ({max} bytes); retry on a host with enough capacity or use a bounded clone"
     )]
     TooLarge { bytes: u64, max: u64 },
 }

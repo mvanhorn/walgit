@@ -7,7 +7,7 @@ use crate::store_proto::{get_message, get_message_if_changed};
 use tracing::Instrument;
 use walgit_git::LocalRepo;
 use walgit_proto::keys;
-use walgit_proto::v1::{EntryKind, LogEntry, Manifest, PackRef, RefSnapshot};
+use walgit_proto::v1::{EntryKind, LogEntry, Manifest, PackRef};
 use walgit_store::{GetOptions, GetResult, ObjectStore, Prefixed, Version};
 
 /// A read guard held for the lifetime of a request. While any guard is alive
@@ -91,7 +91,7 @@ pub(crate) async fn freshness_check(
     store: &Prefixed,
     known: Option<&Version>,
 ) -> Result<SyncOutcome, WalError> {
-    match known {
+    let outcome = match known {
         Some(v) => match get_message_if_changed::<Manifest>(store, keys::MANIFEST, v).await? {
             None => Ok(SyncOutcome::Unchanged),
             Some((meta, manifest)) => Ok(SyncOutcome::Changed {
@@ -106,7 +106,11 @@ pub(crate) async fn freshness_check(
                 manifest: std::sync::Arc::new(manifest),
             }),
         },
+    }?;
+    if let SyncOutcome::Changed { manifest, .. } = &outcome {
+        crate::validate_manifest(manifest)?;
     }
+    Ok(outcome)
 }
 
 /// Download a pack+idx from the store and install it into the local repo.
@@ -204,7 +208,7 @@ pub(crate) async fn download_and_install_pack(
         .install_pack(&pack_path, &idx_path, &extra)
         .instrument(span.clone())
         .await?;
-    if pack.kind == walgit_proto::v1::PackKind::History as i32 {
+    if pack.kind == walgit_proto::v1::PackKind::History as i32 && pack.pack_groups.is_empty() {
         local.mark_history_pack(&oid, &pack.derived_from).await?;
         tracing::info!(checksum = %checksum, base = %pack.derived_from, bytes = pack.pack_size, "history pack installed (commits + trees local)");
     }
@@ -228,6 +232,7 @@ pub(crate) async fn link_and_install_pack(
     pack: &PackRef,
     tmp_dir: &std::path::Path,
     target: &std::path::Path,
+    reporter: &crate::progress::Reporter,
 ) -> Result<(), WalError> {
     let checksum = &pack.checksum;
     let oid = gix_hash::ObjectId::from_hex(checksum.as_bytes())
@@ -240,7 +245,6 @@ pub(crate) async fn link_and_install_pack(
     let idx_path = tmp_dir.join(format!("pack-{checksum}.idx"));
     // The remote reader may already hold this index (web API on the same
     // instance): same bytes, hard-link instead of a second 2 GB download.
-    let remote_idx = crate::remote::idx_dir(local.path()).join(format!("{checksum}.idx"));
     let mut extra = Vec::new();
     let mut side_futs = Vec::new();
     // Idx + rev + bitmap + commit-graph in one round (each already striped).
@@ -257,9 +261,14 @@ pub(crate) async fn link_and_install_pack(
                 .instrument(span.clone()),
         );
     }
-    let idx_r = if remote_idx.is_file()
-        && (std::fs::hard_link(&remote_idx, &idx_path).is_ok()
-            || std::fs::copy(&remote_idx, &idx_path).is_ok())
+    let idx_r = if crate::index_cache::reuse(
+        local.path(),
+        pack,
+        local.object_format().kind(),
+        idx_path.clone(),
+        reporter,
+    )
+    .await?
     {
         tracing::info!(checksum = %checksum, "pack index reused from the remote reader");
         let side_rs = futures::future::join_all(side_futs).await;
@@ -327,6 +336,34 @@ fn nonzero(n: u64) -> Option<u64> {
     (n > 0).then_some(n)
 }
 
+async fn write_complete_body(
+    key: &str,
+    dest: &std::path::Path,
+    mut body: walgit_store::ByteStream,
+    size: u64,
+    report: &(impl Fn(u64) + Sync),
+) -> Result<(), WalError> {
+    use futures::StreamExt;
+    let mut received = 0u64;
+    let mut file = tokio::fs::File::create(dest).await?;
+    while let Some(chunk) = body.next().await {
+        let chunk = chunk?;
+        received = received.saturating_add(chunk.len() as u64);
+        if received > size {
+            return Err(WalError::Corrupt(format!("oversized body for {key}")));
+        }
+        tokio::io::AsyncWriteExt::write_all(&mut file, &chunk).await?;
+        report(chunk.len() as u64);
+    }
+    if received != size {
+        return Err(WalError::Corrupt(format!(
+            "short body for {key}: expected {size}, got {received}"
+        )));
+    }
+    tokio::io::AsyncWriteExt::flush(&mut file).await?;
+    Ok(())
+}
+
 pub(crate) async fn download_object(
     store: &Prefixed,
     key: &str,
@@ -361,16 +398,14 @@ pub(crate) async fn download_object(
     if size <= CHUNK {
         let res = store.get(key, GetOptions::default()).await?;
         return match res {
-            GetResult::Object { body, .. } => {
-                let mut file = tokio::fs::File::create(dest).await?;
-                let mut body = body;
-                while let Some(chunk) = body.next().await {
-                    let chunk = chunk?;
-                    tokio::io::AsyncWriteExt::write_all(&mut file, &chunk).await?;
-                    report(chunk.len() as u64);
+            GetResult::Object { meta, body } => {
+                if meta.size != size {
+                    return Err(WalError::Corrupt(format!(
+                        "size changed for {key}: expected {size}, got {}",
+                        meta.size
+                    )));
                 }
-                tokio::io::AsyncWriteExt::flush(&mut file).await?;
-                Ok(())
+                write_complete_body(key, dest, body, size, &report).await
             }
             GetResult::NotModified { .. } => {
                 Err(WalError::Corrupt(format!("unexpected 304 for {key}")))
@@ -438,7 +473,6 @@ pub(crate) async fn apply_delta(
     new_manifest: &Manifest,
     new_version: &Version,
 ) -> Result<(), WalError> {
-    let store = &handle.store;
     let local = &handle.local;
     let current_state = handle.state.lock().clone();
 
@@ -451,11 +485,15 @@ pub(crate) async fn apply_delta(
     // carry none, the object always does.
     handle.learn_checkpoint_times().await?;
     if need_checkpoint_load {
-        let refs_key = keys::checkpoint_refs_key(checkpoint_seq);
-        if let Some((_, snap)) = get_message::<RefSnapshot>(store, &refs_key).await? {
-            local.load_ref_snapshot(&snap)?;
-            handle.state.lock().applied_seq = checkpoint_seq;
-        }
+        let cp = new_manifest
+            .checkpoint
+            .as_ref()
+            .ok_or_else(|| WalError::Corrupt("missing checkpoint descriptor".into()))?;
+        let snap =
+            crate::snapshots::checkpoint_snapshot(&handle.store, cp, &new_manifest.object_format)
+                .await?;
+        local.load_ref_snapshot(&snap)?;
+        handle.state.lock().applied_seq = checkpoint_seq;
     }
 
     // Replay log entries (refs, and superseded-pack bookkeeping) from
@@ -469,8 +507,15 @@ pub(crate) async fn apply_delta(
     {
         let mut state = handle.state.lock();
         state.manifest_version = Some(new_version.as_str().to_string());
+        let held = handle.manifest();
+        let ready = state.packs_ready()
+            && state.revision == held.revision
+            && held.packs == new_manifest.packs;
         state.applied_seq = head_seq;
         state.revision = new_manifest.revision;
+        if ready {
+            state.packs_revision = new_manifest.revision;
+        }
     }
     crate::state::save_state(local.path(), &handle.state.lock().clone())?;
     local.refresh_async().await?;
@@ -499,6 +544,8 @@ pub(crate) async fn reconcile_packs_inner(
 ) -> Result<(), WalError> {
     let store = &handle.store;
     let local = &handle.local;
+    let segmented = manifest.packs.iter().any(|p| !p.pack_groups.is_empty());
+    local.set_segmented_midx_mode(segmented);
     // Test hook: simulate an unknown blocking call inside the install path
     // (what prod had: 2.6–43 s runtime stalls during materialization). With
     // the bulk runtime this only delays bulk work.
@@ -580,7 +627,11 @@ pub(crate) async fn reconcile_packs_inner(
     // be served from the linked/remote base right away. They are installed by
     // a background task (`RepoHandle::spawn_history_pack_install`) so the
     // first request on an instance never waits for a 7.5 GB download.
-    let is_history = |p: &PackRef| p.kind == walgit_proto::v1::PackKind::History as i32;
+    let is_history = |p: &PackRef| {
+        p.kind == walgit_proto::v1::PackKind::History as i32
+            && p.pack_groups.is_empty()
+            && !p.derived_from.is_empty()
+    };
     let deferred_history: Vec<PackRef> = manifest
         .packs
         .iter()
@@ -709,7 +760,8 @@ pub(crate) async fn reconcile_packs_inner(
                 };
                 match link_to {
                     Some(target) => {
-                        link_and_install_pack(&store, &local, &p, &tmp_dir, &target).await
+                        link_and_install_pack(&store, &local, &p, &tmp_dir, &target, &reporter)
+                            .await
                     }
                     None => {
                         download_and_install_pack(&store, &local, &p, &tmp_dir, Some(&cb)).await
@@ -767,6 +819,44 @@ pub(crate) async fn reconcile_packs_inner(
         handle.state.lock().pending_pack_removals = still_pending;
     }
 
+    if segmented {
+        if remote_served.is_empty() {
+            let ids = manifest
+                .packs
+                .iter()
+                .map(|p| {
+                    gix_hash::ObjectId::from_hex(p.checksum.as_bytes())
+                        .map_err(|e| WalError::Corrupt(format!("pack checksum: {e}")))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let pin = handle.pin_local_objects().await;
+            let repo = local.clone();
+            let (refs, pin) = tokio::task::spawn_blocking(move || {
+                let refs = repo.refs();
+                (refs, pin)
+            })
+            .await
+            .map_err(|e| WalError::Corrupt(format!("MIDX refs: {e}")))?;
+            let refs = refs?;
+            if let Some(commit) = refs.refs.iter().find(|r| r.name.starts_with("refs/heads/")) {
+                let oid = gix_hash::ObjectId::from_hex(commit.oid.as_bytes())
+                    .map_err(|e| WalError::Corrupt(format!("MIDX root: {e}")))?;
+                // Bitmap verification is strict; a concurrent ref move can
+                // legitimately outpace the captured pack inventory. Failure
+                // leaves ordinary non-bitmap object traversal available.
+                if let Err(error) = local.write_verified_midx(&ids, oid, pin).await {
+                    tracing::warn!(repo = %handle.id, %error, "segmented MIDX unavailable; ordinary traversal remains active");
+                }
+            }
+        } else {
+            // A MIDX bitmap over absent pack bytes is not native-readable.
+            // Invalidation never queues a writer behind long-lived readers.
+            if let Ok(_guard) = handle.rw.try_write() {
+                local.invalidate_midx()?;
+            }
+        }
+    }
+
     {
         let mut state = handle.state.lock();
         state.packs_revision = manifest.revision;
@@ -811,7 +901,11 @@ pub(crate) async fn maintain_commit_graph(
     // After a base change every non-base pack must be re-added (the old chain
     // layers were dropped); otherwise only what was just installed.
     // History packs hold the base's commits, already covered by its layer.
-    let is_history = |p: &&PackRef| p.kind == walgit_proto::v1::PackKind::History as i32;
+    let is_history = |p: &&PackRef| {
+        p.kind == walgit_proto::v1::PackKind::History as i32
+            && p.pack_groups.is_empty()
+            && !p.derived_from.is_empty()
+    };
     let candidates: Vec<&PackRef> = if base_changed {
         manifest
             .packs
@@ -1048,6 +1142,30 @@ pub(crate) async fn on_bulk_runtime<T: Send + 'static>(
 mod download_tests {
     use super::download_object;
     use walgit_store::{ObjectStoreExt, Prefixed, PutMode, memory::MemoryStore};
+
+    #[tokio::test]
+    async fn clean_early_eof_is_rejected_and_retry_replaces_partial_bytes() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let dest = dir.path().join("download.tmp");
+        let body = |bytes: &'static [u8]| -> walgit_store::ByteStream {
+            Box::pin(futures::stream::once(async move {
+                Ok(bytes::Bytes::from_static(bytes))
+            }))
+        };
+        assert!(
+            super::write_complete_body("pack", &dest, body(b"short"), 8, &|_| {})
+                .await
+                .is_err()
+        );
+        assert!(
+            super::write_complete_body("pack", &dest, body(b"too many bytes"), 8, &|_| {})
+                .await
+                .is_err()
+        );
+        super::write_complete_body("pack", &dest, body(b"complete"), 8, &|_| {}).await?;
+        assert_eq!(std::fs::read(&dest)?, b"complete");
+        Ok(())
+    }
 
     #[tokio::test]
     async fn striped_download_matches_source() {

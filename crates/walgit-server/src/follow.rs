@@ -8,7 +8,7 @@
 //! stream the pack through `ingest_pack`, connectivity + fast-forward checks, one
 //! `publish_push` — the same PUSH entry receive-pack publishes, `principal =
 //! upstream`. Every other instance picks it up the way it picks up a push (the next
-//! conditional GET of `manifest.pb`); the maintainer's checkpoints/bundles fold it
+//! conditional GET of `manifest.pb`); the maintainer's checkpoints fold it
 //! like a push. A rewound upstream is refused (not a fast-forward) and logged every
 //! round until a human decides; policy is not evaluated (follow is configuration,
 //! not a principal — remove the ref from `follow` to stop it).

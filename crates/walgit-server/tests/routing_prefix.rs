@@ -210,7 +210,7 @@ fn repo_prefix_location_regex_semantics() {
         "/acme/monorepo.git/info/refs",
         "/acme/monorepo/api/refs",
         "/acme/monorepo/api-browser/refs",
-        "/acme/monorepo/bundles/weekly/x",
+        "/acme/monorepo/info/lfs/objects/abc",
         "/acme/monorepo/info/lfs/objects/aa",
         "/acme/monorepo/settings",
         "/acme/monorepo/tree/main",

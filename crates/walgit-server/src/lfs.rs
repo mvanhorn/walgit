@@ -162,7 +162,7 @@ pub async fn batch(
             });
         } else if exists {
             let href = match cfg.lfs.serve_via {
-                walgit_config::BundleServe::SignedUrl => store
+                walgit_config::LfsServe::SignedUrl => store
                     .signed_get_url(&key, st.cfg.lfs.signed_url_ttl)
                     .await
                     .ok()

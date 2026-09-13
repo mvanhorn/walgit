@@ -88,7 +88,7 @@ impl Remote {
     /// Read + write into the local loose store (so git can see it).
     pub async fn fault(&self, oid: &gix_hash::oid) -> Result<Arc<Obj>, ApiError> {
         let o = self.get(oid).await?;
-        self.write_local(oid, &o)?;
+        self.write_local(vec![(oid.to_owned(), o.clone())]).await?;
         Ok(o)
     }
 
@@ -104,23 +104,49 @@ impl Remote {
         };
         for chunk in todo.chunks(PAR) {
             let results = futures::future::join_all(chunk.iter().map(|o| self.get(o))).await;
+            let mut batch = Vec::with_capacity(chunk.len());
             for (oid, r) in chunk.iter().zip(results) {
-                let o = r?;
-                self.write_local(oid, &o)?;
+                batch.push((*oid, r?));
             }
+            self.write_local(batch).await?;
         }
         Ok(())
     }
 
-    fn write_local(&self, oid: &gix_hash::oid, o: &Obj) -> Result<(), ApiError> {
-        if self.faulted.lock().contains(oid) {
+    /// Write freshly read objects into the local loose store, skipping what is
+    /// already faulted. Deflating an object and creating and renaming its file
+    /// is blocking filesystem work, so a whole batch goes to one
+    /// `spawn_blocking` rather than running on the tokio worker that read it
+    /// (principle VI: never block the async runtime).
+    async fn write_local(&self, batch: Vec<(ObjectId, Arc<Obj>)>) -> Result<(), ApiError> {
+        let todo: Vec<(ObjectId, Arc<Obj>)> = {
+            let done = self.faulted.lock();
+            batch
+                .into_iter()
+                .filter(|(oid, _)| !done.contains(oid))
+                .collect()
+        };
+        if todo.is_empty() {
             return Ok(());
         }
-        self.local
-            .write_loose_object(o.kind, oid, &o.data)
-            .map_err(|e| ApiError::Internal(format!("fault object {oid}: {e}")))?;
-        self.faulted.lock().insert(oid.to_owned());
-        Ok(())
+        let local = self.local.clone();
+        let (written, outcome) = tokio::task::spawn_blocking(move || {
+            let mut written: Vec<ObjectId> = Vec::with_capacity(todo.len());
+            for (oid, o) in todo {
+                if let Err(e) = local.write_loose_object(o.kind, &oid, &o.data) {
+                    let msg = format!("fault object {oid}: {e}");
+                    return (written, Err(ApiError::Internal(msg)));
+                }
+                written.push(oid);
+            }
+            (written, Ok(()))
+        })
+        .await
+        .map_err(|e| ApiError::Internal(format!("fault write task: {e}")))?;
+        if !written.is_empty() {
+            self.faulted.lock().extend(written);
+        }
+        outcome
     }
 
     pub async fn kind_and_size(

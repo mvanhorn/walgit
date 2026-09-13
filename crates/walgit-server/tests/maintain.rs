@@ -1,10 +1,106 @@
 //! The `maintain` role's pass: checkpoint-if-due (refs-level, on an instance
-//! that cannot hold the packs), bundles-if-due, compaction, all as tasks.
+//! that cannot hold the packs), compaction, all as tasks.
 
 mod harness;
 
 use harness::{Server, git, git_in};
 use std::collections::HashMap;
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn classification_preserves_push_bytes_and_shared_group_cuts_settle() -> anyhow::Result<()> {
+    use walgit_server::ops::{CompactRequest, compact_repo};
+    let server = Server::start_with_tweak(|c| {
+        c.cache.mode = walgit_config::CacheMode::Disk;
+        c.packs.frozen_coverage_target = 0.0;
+    })
+    .await?;
+    server.put_repo("o", "shared").await?;
+    let src = tempfile::tempdir()?;
+    git_in(src.path(), &["init", "-q", "-b", "main"])?;
+    git_in(
+        src.path(),
+        &["config", "user.email", "test@example.invalid"],
+    )?;
+    git_in(src.path(), &["config", "user.name", "Test"])?;
+    std::fs::write(src.path().join("shared.txt"), "shared bytes\n")?;
+    git_in(src.path(), &["add", "."])?;
+    git_in(src.path(), &["commit", "-q", "-m", "code"])?;
+    git(
+        &["push", "-q", &server.repo_url("o", "shared"), "main"],
+        src.path(),
+    )?;
+    let handle = server
+        .state
+        .registry
+        .open(&walgit_git::RepoId::new("o", "shared")?)
+        .await?;
+    let before = handle.manifest().packs.clone();
+    compact_repo(&handle, CompactRequest::default(), &|_| {}).await?;
+    let after = handle.manifest();
+    assert_eq!(before.len(), after.packs.len());
+    for (old, new) in before.iter().zip(&after.packs) {
+        assert_eq!(
+            (&old.checksum, old.pack_size, old.tier),
+            (&new.checksum, new.pack_size, new.tier)
+        );
+        assert_eq!(new.pack_groups, ["code"]);
+    }
+    // A distinct metadata commit shares the complete tree/blob with code.
+    git_in(src.path(), &["checkout", "-q", "--orphan", "meta"])?;
+    git_in(src.path(), &["commit", "-q", "-m", "metadata"])?;
+    let meta = git_in(src.path(), &["rev-parse", "HEAD"])?;
+    git(
+        &[
+            "push",
+            "-q",
+            &server.repo_url("o", "shared"),
+            "HEAD:refs/meta/state",
+        ],
+        src.path(),
+    )?;
+    compact_repo(
+        &handle,
+        CompactRequest {
+            force: true,
+            rebuild_base: true,
+        },
+        &|_| {},
+    )
+    .await?;
+    // Repair certificates after the conserving cut; it must not recut shared bytes.
+    compact_repo(&handle, CompactRequest::default(), &|_| {}).await?;
+    let stable = handle.manifest();
+    assert!(
+        stable
+            .packs
+            .iter()
+            .any(|p| p.pack_groups.contains(&"code".into())
+                && p.pack_groups.contains(&"meta".into()))
+    );
+    for _ in 0..3 {
+        compact_repo(&handle, CompactRequest::default(), &|_| {}).await?;
+        assert_eq!(handle.manifest().packs, stable.packs);
+    }
+    let cold = server.start_sibling_with(|_| {}).await?;
+    let clone = tempfile::tempdir()?;
+    git(
+        &[
+            "clone",
+            "-q",
+            "--mirror",
+            "--server-option=ref-view=all",
+            &cold.repo_url("o", "shared"),
+            clone.path().to_str().unwrap(),
+        ],
+        src.path(),
+    )?;
+    assert_eq!(
+        git_in(clone.path(), &["rev-parse", "refs/meta/state"])?.trim(),
+        meta.trim()
+    );
+    git_in(clone.path(), &["fsck", "--strict"])?;
+    Ok(())
+}
 
 /// Every await is bounded so a hang names the step instead of stalling CI.
 macro_rules! step {
@@ -58,8 +154,7 @@ async fn pass_checkpoints_due_repos_refs_level_and_reports_tasks() -> anyhow::Re
             c.cache.max_bytes = walgit_config::ByteSize::b(1);
             c.wal.snapshot_every_entries = 0;
             c.wal.checkpoint_interval = std::time::Duration::from_millis(1);
-            c.compaction.enabled = false;
-            c.bundles.enabled = false;
+            c.packs.enabled = false;
         })
     )?;
     tokio::time::sleep(std::time::Duration::from_millis(5)).await;
@@ -99,67 +194,27 @@ async fn pass_checkpoints_due_repos_refs_level_and_reports_tasks() -> anyhow::Re
     )?;
     assert_eq!(report.checkpoints, 0);
 
-    // Bundles from a maintainer that never served this repo: the build must
-    // materialize the packs itself (prod failed with "bad object refs/heads/main").
-    let bundler = step!(
-        "start bundler",
+    // An object-capable maintainer audits the checkpointed repository once.
+    let auditor = step!(
+        "start auditor",
         front.start_sibling_with(|c| {
             c.server.roles = vec![walgit_config::Role::Maintain];
             c.wal.snapshot_every_entries = 0;
-            c.compaction.enabled = false;
-            c.bundles.enabled = true;
+            c.packs.enabled = false;
         })
     )?;
-    // Priority loop: the first unit is the missing weekly slot (checkpoint is
-    // not due), one unit per pass, next pass moves to the daily chain, and a
-    // re-run after everything is built is idempotent (Idle).
     let id = walgit_git::RepoId::new("o", "r")?;
-    assert!(
-        matches!(step!("unit 1", next_unit(&bundler.state, &id))?, Unit::BundleSlot(ref s, _) if s == "weekly")
-    );
-    let report = step!("bundler pass", run_pass(&bundler.state))?;
-    assert_eq!((report.units, report.bundles), (1, 1), "{report:?}");
-    let list = step!(
-        "bundle list",
-        bundler.get_text("/o/r.git/bundles/list", &[])
-    )?;
-    assert!(list.contains("[bundle \"weekly-"), "{list}");
-    // Weekly token = its slot (a Sunday 23:00 UTC epoch, divisible by 3600).
-    let tok: u64 = list
-        .lines()
-        .find_map(|l| {
-            l.trim()
-                .strip_prefix("creationToken = ")
-                .and_then(|v| v.parse().ok())
-        })
-        .unwrap();
-    assert_eq!(tok % 3600, 0, "token is a slot epoch: {tok}");
-    // Next units: dailies (oldest first) — but a daily slot with no new objects
-    // over the weekly is skipped — then the lowest-priority audit (fsck, once;
-    // clean), so the loop converges to Idle.
-    let mut audits = 0;
-    for _ in 0..40 {
-        match step!("unit n", next_unit(&bundler.state, &id))? {
-            Unit::Idle => break,
-            Unit::BundleSlot(..) => {
-                let _ = step!("pass n", run_pass(&bundler.state))?;
-            }
-            Unit::Fsck(_) => {
-                audits += 1;
-                let _ = step!("pass fsck", run_pass(&bundler.state))?;
-            }
-            other => panic!("unexpected unit {other:?}"),
-        }
-    }
+    assert!(matches!(
+        step!("audit due", next_unit(&auditor.state, &id))?,
+        Unit::Fsck(_)
+    ));
+    let report = step!("audit pass", run_pass(&auditor.state))?;
+    assert_eq!(report.units, 1, "{report:?}");
     assert_eq!(
-        audits, 1,
-        "the audit runs once (never audited) and is then not due for fsck_interval"
-    );
-    assert_eq!(
-        step!("unit idle", next_unit(&bundler.state, &id))?,
+        step!("unit idle", next_unit(&auditor.state, &id))?,
         Unit::Idle
     );
-    let report = step!("idempotent pass", run_pass(&bundler.state))?;
+    let report = step!("idempotent pass", run_pass(&auditor.state))?;
     assert_eq!(report.units, 0, "{report:?}");
     // Placement by rule: a maintainer not assigned to the repo plans nothing.
     let elsewhere = step!(
@@ -277,8 +332,7 @@ async fn fsck_unit_records_missing_objects_and_repair_unit_fetches_them_from_ups
         Server::start_with_tweak(|c| {
             c.git.allow_any_sha1_in_want = true;
             c.maintenance.checkpoints = false;
-            c.compaction.enabled = false;
-            c.bundles.enabled = false;
+            c.packs.enabled = false;
             c.maintenance.fsck_interval = std::time::Duration::from_hours(1);
         })
     )?;
@@ -675,275 +729,9 @@ async fn host_excluded_from_serving_a_repo_refuses_object_work_with_503() -> any
     Ok(())
 }
 
-/// The static bundle list must show a bundle this host just built — the list is
-/// cached per repo (TTL) and the `bundle` op invalidates it. Prod 2026-08-21:
-/// the SSD host advertised 4 hourlies for 20+ min after it had published the 5th
-/// (the cache was keyed by manifest version, which a publish does not change).
+/// Manual base rebuilding conserves the imported base and subsequent pushes.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn bundle_list_shows_a_bundle_right_after_this_host_builds_it() -> anyhow::Result<()> {
-    let server = step!(
-        "start",
-        Server::start_with_tweak(|c| {
-            c.server.roles = vec![walgit_config::Role::Serve, walgit_config::Role::Maintain];
-            c.bundles.enabled = true;
-            c.bundles.min_commits = 1;
-            c.compaction.enabled = false;
-            c.maintenance.checkpoints = false;
-        })
-    )?;
-    step!("put repo", server.put_repo("o", "r"))?;
-    let src = tempfile::tempdir()?;
-    git_in(src.path(), &["init", "-q", "-b", "main"])?;
-    git_in(src.path(), &["config", "user.email", "t@t"])?;
-    git_in(src.path(), &["config", "user.name", "Tester"])?;
-    std::fs::write(src.path().join("f.txt"), "one\n")?;
-    git_in(src.path(), &["add", "."])?;
-    git_in(src.path(), &["commit", "-q", "-m", "one"])?;
-    git(
-        &["push", "-q", &server.repo_url("o", "r"), "main"],
-        src.path(),
-    )?;
-
-    // Weekly via the op (what the maintainer runs), then read + cache the list.
-    let id = walgit_git::RepoId::new("o", "r")?;
-    let mut params = std::collections::HashMap::new();
-    params.insert("strategy".to_string(), "weekly".to_string());
-    let t = walgit_server::ops::start(server.state.clone(), id.clone(), "bundle", params)
-        .await
-        .map_err(|_| anyhow::anyhow!("op start failed"))?;
-    assert!(t.wait_done(std::time::Duration::from_secs(30)).await);
-    let list1 = step!("list 1", server.get_text("/o/r.git/bundles/list", &[]))?;
-    assert!(list1.contains("[bundle \"weekly-"), "{list1}");
-    assert!(!list1.contains("daily-"));
-    let _again = step!(
-        "list 1 again (cached)",
-        server.get_text("/o/r.git/bundles/list", &[])
-    )?;
-
-    // New objects, a daily built by the op → the NEXT list shows it, no TTL wait.
-    std::fs::write(src.path().join("g.txt"), "two\n")?;
-    git_in(src.path(), &["add", "."])?;
-    git_in(src.path(), &["commit", "-q", "-m", "two"])?;
-    git(
-        &["push", "-q", &server.repo_url("o", "r"), "main"],
-        src.path(),
-    )?;
-    let mut params = std::collections::HashMap::new();
-    params.insert("strategy".to_string(), "daily".to_string());
-    let t = walgit_server::ops::start(server.state.clone(), id.clone(), "bundle", params)
-        .await
-        .map_err(|_| anyhow::anyhow!("op start failed"))?;
-    assert!(t.wait_done(std::time::Duration::from_secs(30)).await);
-    assert!(t.outcome().is_some_and(|o| o.is_ok()), "{:?}", t.outcome());
-    let list2 = step!("list 2", server.get_text("/o/r.git/bundles/list", &[]))?;
-    assert!(
-        list2.contains("[bundle \"daily-"),
-        "the list served right after the build must contain it:\n{list2}"
-    );
-
-    // Another host on the same bucket, which cached the list BEFORE the next build
-    // and is never told about it: its next GET must still be fresh (the cache is
-    // keyed by list.pb's own version, probed per request — not by a TTL).
-    let other = step!(
-        "start other",
-        server.start_sibling_with(|c| {
-            c.bundles.enabled = true;
-        })
-    )?;
-    let seen = step!("other list", other.get_text("/o/r.git/bundles/list", &[]))?;
-    assert!(seen.contains("daily-") && !seen.contains("hourly-"));
-    std::fs::write(src.path().join("h.txt"), "three\n")?;
-    git_in(src.path(), &["add", "."])?;
-    git_in(src.path(), &["commit", "-q", "-m", "three"])?;
-    git(
-        &["push", "-q", &server.repo_url("o", "r"), "main"],
-        src.path(),
-    )?;
-    let mut params = std::collections::HashMap::new();
-    params.insert("strategy".to_string(), "hourly".to_string());
-    let t = walgit_server::ops::start(server.state.clone(), id.clone(), "bundle", params)
-        .await
-        .map_err(|_| anyhow::anyhow!("op start failed"))?;
-    assert!(t.wait_done(std::time::Duration::from_secs(30)).await);
-    let list3 = step!(
-        "other list after a build elsewhere",
-        other.get_text("/o/r.git/bundles/list", &[])
-    )?;
-    assert!(
-        list3.contains("[bundle \"hourly-"),
-        "a host that did not build must still serve the new list at once:\n{list3}"
-    );
-    Ok(())
-}
-
-/// A hundred closed hourly slots with nothing to cut must not cost a hundred passes
-/// (closed = the slot's as-of instant has passed, whatever the strategy's period —
-/// a daily is final an hour after 23:00, not at the next 23:00):
-/// `next_unit` settles them at plan time (refs-level; verdicts recorded in the
-/// list), and the live slot with real objects is built in the SAME pass.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn one_pass_settles_all_closed_empty_slots() -> anyhow::Result<()> {
-    let server = step!(
-        "start",
-        Server::start_with_tweak(|c| {
-            c.server.roles = vec![walgit_config::Role::Serve, walgit_config::Role::Maintain];
-            c.bundles.enabled = true;
-            c.bundles.main_only = true;
-            c.bundles.min_commits = 1;
-            c.compaction.enabled = false;
-            c.maintenance.checkpoints = false;
-            c.maintenance.fsck_interval = std::time::Duration::ZERO;
-            // weekly (full) + hourly on weekly: the closed hours since the weekly are empty.
-            c.bundles.strategy.retain(|s| s.name != "daily");
-            for s in &mut c.bundles.strategy {
-                if s.name == "hourly" {
-                    s.base = Some("weekly".into());
-                    s.backfill_max = 0;
-                }
-            }
-        })
-    )?;
-    step!("put repo", server.put_repo("o", "r"))?;
-    let src = tempfile::tempdir()?;
-    git_in(src.path(), &["init", "-q", "-b", "main"])?;
-    git_in(src.path(), &["config", "user.email", "t@t"])?;
-    git_in(src.path(), &["config", "user.name", "Tester"])?;
-    std::fs::write(src.path().join("f.txt"), "one\n")?;
-    git_in(src.path(), &["add", "."])?;
-    git_in(src.path(), &["commit", "-q", "-m", "one"])?;
-    // Publish the first state 31 hours in the past so that 30 closed hourly slots exist.
-    let id = walgit_git::RepoId::new("o", "r")?;
-    let h = step!("open", server.state.registry.open(&id))?;
-    let now = std::time::SystemTime::now();
-    let c1 = git_in(src.path(), &["rev-parse", "HEAD"])?
-        .trim()
-        .to_string();
-    // Push normally first (objects), then time-shift the ref history with an explicit created_at.
-    git(
-        &["push", "-q", &server.repo_url("o", "r"), "main"],
-        src.path(),
-    )?;
-    step!("sync", h.sync())?;
-    // A weekly cut at the Sunday before yesterday (earliest state), via the op.
-    let weekly = server
-        .state
-        .cfg
-        .bundles
-        .strategy
-        .iter()
-        .find(|s| s.name == "weekly")
-        .unwrap()
-        .clone();
-    let sunday = walgit_bundle::slots::last_slot_at_or_before(
-        &weekly,
-        now - std::time::Duration::from_hours(36),
-    )?
-    .unwrap();
-    let mut params = std::collections::HashMap::new();
-    params.insert("strategy".to_string(), "weekly".to_string());
-    params.insert("slot".to_string(), sunday.to_string());
-    let t = walgit_server::ops::start(server.state.clone(), id.clone(), "bundle", params)
-        .await
-        .map_err(|_| anyhow::anyhow!("op start"))?;
-    assert!(t.wait_done(std::time::Duration::from_secs(30)).await);
-    let list = walgit_bundle::ops::read_list(h.store())
-        .await?
-        .expect("list");
-    assert_eq!(list.bundles.len(), 1, "{list:?}");
-    drop(c1);
-
-    // New objects NOW (the live hour has real work).
-    std::fs::write(src.path().join("g.txt"), "two\n")?;
-    git_in(src.path(), &["add", "."])?;
-    git_in(src.path(), &["commit", "-q", "-m", "two"])?;
-    git(
-        &["push", "-q", &server.repo_url("o", "r"), "main"],
-        src.path(),
-    )?;
-
-    // Plan before: only the two newest hourly slots are wanted (D21, 2026-08-22) — the older ones
-    // are not work even though they are missing; the closed one of the two is empty (the weekly
-    // holds everything up to now-ish).
-    let ctx = walgit_bundle::slots::PlanContext {
-        first_state: h.first_state_time(),
-        can_full: true,
-        can_incremental: true,
-        wrong_host_reason: None,
-    };
-    let rows = server.state.bundles.plan(&id, now, ctx).await?;
-    let missing_before = rows
-        .iter()
-        .filter(|r| r.strategy == "hourly" && r.status == walgit_bundle::slots::SlotStatus::Missing)
-        .count();
-    assert_eq!(
-        missing_before,
-        walgit_bundle::slots::INCREMENTALS_KEPT,
-        "only the newest slots are planned: {rows:?}"
-    );
-
-    // ONE pass.
-    let report = step!("pass", walgit_server::maintain::run_pass(&server.state))?;
-    let list = walgit_bundle::ops::read_list(h.store())
-        .await?
-        .expect("list");
-    let hourlies: Vec<_> = list
-        .bundles
-        .iter()
-        .filter(|b| b.strategy == "hourly")
-        .collect();
-    assert!(
-        !list.skipped.is_empty(),
-        "closed empty slots recorded in the list: {report:?}"
-    );
-    // Every CLOSED missing slot is settled in that one pass. The open (current)
-    // slot may stay missing: the commit above was pushed after its fire time, so
-    // as of the slot there is nothing new — it belongs to the next hour (D22).
-    let hourly = server
-        .state
-        .cfg
-        .bundles
-        .strategy
-        .iter()
-        .find(|s| s.name == "hourly")
-        .unwrap()
-        .clone();
-    let rows = server
-        .state
-        .bundles
-        .plan(&id, std::time::SystemTime::now(), ctx)
-        .await?;
-    let still_missing_closed: Vec<u64> = rows
-        .iter()
-        .filter(|r| {
-            r.strategy == "hourly"
-                && r.status == walgit_bundle::slots::SlotStatus::Missing
-                && walgit_bundle::slots::slot_closed(&hourly, r.slot, std::time::SystemTime::now())
-        })
-        .map(|r| r.slot)
-        .collect();
-    assert!(
-        still_missing_closed.is_empty(),
-        "after one pass no closed slot stays missing: {still_missing_closed:?}\nskipped={} built={}",
-        list.skipped.len(),
-        hourlies.len()
-    );
-    assert!(
-        list.skipped.len() >= missing_before - 1,
-        "settled at plan time, not one per pass: skipped={} missing_before={missing_before}",
-        list.skipped.len()
-    );
-    Ok(())
-}
-
-/// Sunday's weekly on an ssd maintainer (the SSD host): the missing full slot of a
-/// repository that has a tier-2 base and pushes since it first yields
-/// `BaseRebuild` (compact --base: new base + history pack + checkpoint), then the
-/// full slot itself, which COMPOSES header ∘ base (no pack-objects of the
-/// history). Pushes landing after the rebuild do not re-trigger it this week.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn weekly_slot_rebuilds_the_base_then_composes_it_on_an_ssd_maintainer() -> anyhow::Result<()>
-{
-    use walgit_server::maintain::{Unit, next_unit, run_pass};
+async fn manual_base_rebuild_on_an_ssd_maintainer() -> anyhow::Result<()> {
     let server = step!(
         "start",
         Server::start_with_tweak(|c| {
@@ -951,13 +739,10 @@ async fn weekly_slot_rebuilds_the_base_then_composes_it_on_an_ssd_maintainer() -
                 walgit_config::Role::Serve,
                 walgit_config::Role::Maintain,
                 walgit_config::Role::Compact,
-                walgit_config::Role::Bundle,
             ];
             c.maintenance.disk = walgit_config::MaintainerDisk::Ssd;
             c.cache.mode = walgit_config::CacheMode::Disk;
-            c.bundles.enabled = true;
-            c.bundles.strategy.truncate(1); // weekly only
-            c.compaction.enabled = true;
+            c.packs.enabled = true;
             c.maintenance.checkpoints = false;
             c.maintenance.fsck_interval = std::time::Duration::ZERO;
         })
@@ -1030,18 +815,26 @@ async fn weekly_slot_rebuilds_the_base_then_composes_it_on_an_ssd_maintainer() -
     )?;
     step!("sync after push", h.sync())?;
 
-    // The missing weekly slot → rebuild the base first.
-    let unit = step!("plan 1", next_unit(&server.state, &id))?;
+    let outcome = step!(
+        "manual rebuild",
+        walgit_server::ops::compact_repo(
+            &h,
+            walgit_server::ops::CompactRequest {
+                force: true,
+                rebuild_base: true
+            },
+            &|_| {},
+        )
+    )?;
     assert!(
-        matches!(unit, Unit::BaseRebuild(ref s, _) if s == "weekly"),
-        "{unit:?}"
-    );
-    let report = step!("pass 1 (rebuild)", run_pass(&server.state))?;
-    assert_eq!(
-        report.compactions,
-        1,
-        "rebuild unit: {report:?}\ntasks: {}",
-        server.get_text("/o/r/api/tasks", &[]).await?
+        matches!(
+            outcome,
+            walgit_server::ops::CompactOutcome::Published {
+                rebuild_base: true,
+                ..
+            }
+        ),
+        "{outcome:?}"
     );
     step!("sync after rebuild", h.sync())?;
     let base2 = h
@@ -1063,62 +856,7 @@ async fn weekly_slot_rebuilds_the_base_then_composes_it_on_an_ssd_maintainer() -
             .collect::<Vec<_>>()
     );
 
-    // A push lands between the rebuild and the compose (the rig's churn, 2026-08-22: the compose
-    // refused for as long as refs kept moving — "no ref snapshot at the base's seq"). The header
-    // must carry the refs AT THE BASE'S SEQ (replayed from the WAL), not the new tip.
-    let base_tip = git_in(src.path(), &["rev-parse", "HEAD"])?
-        .trim()
-        .to_string();
-    std::fs::write(src.path().join("between.txt"), "between\n")?;
-    git_in(src.path(), &["add", "."])?;
-    git_in(src.path(), &["commit", "-q", "-m", "between"])?;
-    git(
-        &["push", "-q", &server.repo_url("o", "r"), "main"],
-        src.path(),
-    )?;
-    step!("sync after push between", h.sync())?;
-
-    // Next: the weekly slot itself, composed from the new base.
-    let unit = step!("plan 2", next_unit(&server.state, &id))?;
-    assert!(
-        matches!(unit, Unit::BundleSlot(ref s, _) if s == "weekly"),
-        "{unit:?}"
-    );
-    let report = step!("pass 2 (compose)", run_pass(&server.state))?;
-    assert_eq!(
-        report.bundles,
-        1,
-        "compose unit: {report:?}\ntasks: {}",
-        server.get_text("/o/r/api/tasks", &[]).await?
-    );
-    let list = walgit_bundle::ops::read_list(h.store())
-        .await?
-        .expect("list");
-    let weekly = list
-        .bundles
-        .iter()
-        .find(|b| b.strategy == "weekly")
-        .expect("weekly entry");
-    let m2 = h.manifest();
-    let base_pack = m2.packs.iter().find(|p| p.checksum == base2).unwrap();
-    assert!(
-        weekly.size > base_pack.pack_size && weekly.size < base_pack.pack_size + 4096,
-        "composed = header ∘ base pack: {} vs pack {}",
-        weekly.size,
-        base_pack.pack_size
-    );
-    assert_eq!(weekly.seq, base_pack.seq);
-    let main_tip = weekly
-        .tips
-        .iter()
-        .find(|t| t.name == "refs/heads/main")
-        .expect("main tip");
-    assert_eq!(
-        main_tip.oid, base_tip,
-        "the header carries main as of the base's seq, not the push that landed since"
-    );
-
-    // A push after the rebuild: no second rebuild this week; the plan is idle (slot built).
+    // A push after the rebuild remains readable without another rebuild.
     std::fs::write(src.path().join("h.txt"), "three\n")?;
     git_in(src.path(), &["add", "."])?;
     git_in(src.path(), &["commit", "-q", "-m", "three"])?;
@@ -1127,12 +865,7 @@ async fn weekly_slot_rebuilds_the_base_then_composes_it_on_an_ssd_maintainer() -
         src.path(),
     )?;
     step!("sync after push 2", h.sync())?;
-    let unit = step!("plan 3", next_unit(&server.state, &id))?;
-    assert!(!matches!(unit, Unit::BaseRebuild(..)), "{unit:?}");
-
-    // An imported multi-pack set (large-repository measurement: 11 tier-2 packs, the 32 GB
-    // base among 5 MB ones) is itself a reason to rebuild next week: the
-    // compose needs exactly one base, and "the base" is the biggest one.
+    // Additional imported tier-2 packs remain represented in the inventory.
     let extra = tempfile::tempdir()?;
     let blob = git_in(src.path(), &["rev-parse", "HEAD:h.txt"])?
         .trim()
@@ -1169,20 +902,21 @@ async fn weekly_slot_rebuilds_the_base_then_composes_it_on_an_ssd_maintainer() -
         base2,
         "the base is the biggest tier-2 pack, not the newest"
     );
-    let next_weekly =
-        walgit_bundle::slots::from_epoch(weekly.slot) + std::time::Duration::from_hours(168);
-    let up = walgit_server::maintain::upcoming(
-        &h,
-        &h.effective_config(),
-        &walgit_server::maintain::heartbeats(&server.state).await?,
-        next_weekly - std::time::Duration::from_mins(1),
-    )
-    .await;
-    let w = up
-        .iter()
-        .find(|u| u.strategy == "weekly")
-        .expect("weekly row");
-    assert!(w.unit.starts_with("base rebuild"), "{w:?}");
+    let clone = tempfile::tempdir()?;
+    git(
+        &[
+            "clone",
+            "-q",
+            &server.repo_url("o", "r"),
+            clone.path().to_str().unwrap(),
+        ],
+        clone.path().parent().unwrap(),
+    )?;
+    git_in(clone.path(), &["fsck", "--strict"])?;
+    assert_eq!(
+        git_in(clone.path(), &["rev-parse", "HEAD"])?,
+        git_in(src.path(), &["rev-parse", "HEAD"])?
+    );
     Ok(())
 }
 
@@ -1198,8 +932,7 @@ async fn maintainer_builds_and_publishes_missing_rev_indexes() -> anyhow::Result
         "start",
         Server::start_with_tweak(|c| {
             c.maintenance.checkpoints = false;
-            c.compaction.enabled = false;
-            c.bundles.enabled = false;
+            c.packs.enabled = false;
             c.maintenance.fsck_interval = std::time::Duration::ZERO;
         })
     )?;
@@ -1344,650 +1077,39 @@ async fn maintainer_builds_and_publishes_missing_rev_indexes() -> anyhow::Result
     Ok(())
 }
 
-/// An incremental slot whose tip set equals the newest built incremental of
-/// the strategy on the same base is `skipped (unchanged since <id>)` — recorded
-/// like too-small, never cut. Without it an idle night cuts 23–48 identical
-/// 315 MB hourlies on a large repository (2026-08-21 08:00/09:00/10:00, same tip, no push
-/// since 06:43Z): `min_commits` counts since the BASE, not since the previous
-/// incremental. Clients are unaffected (git stops at the first bundle whose
-/// prerequisites it has).
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn identical_incremental_slots_are_skipped_as_unchanged() -> anyhow::Result<()> {
-    let server = step!(
-        "start",
-        Server::start_with_tweak(|c| {
-            c.server.roles = vec![walgit_config::Role::Serve, walgit_config::Role::Maintain];
-            c.bundles.enabled = true;
-            c.bundles.main_only = true;
-            c.bundles.min_commits = 1;
-            c.compaction.enabled = false;
-            c.maintenance.checkpoints = false;
-            c.maintenance.fsck_interval = std::time::Duration::ZERO;
-            c.bundles.strategy.retain(|s| s.name != "daily");
-            for s in &mut c.bundles.strategy {
-                if s.name == "hourly" {
-                    s.base = Some("weekly".into());
-                    s.backfill_max = 0;
-                }
-            }
-        })
-    )?;
-    step!("put repo", server.put_repo("o", "r"))?;
-    let src = tempfile::tempdir()?;
-    git_in(src.path(), &["init", "-q", "-b", "main"])?;
-    git_in(src.path(), &["config", "user.email", "t@t"])?;
-    git_in(src.path(), &["config", "user.name", "Tester"])?;
-    std::fs::write(src.path().join("f.txt"), "one\n")?;
-    git_in(src.path(), &["add", "."])?;
-    git_in(src.path(), &["commit", "-q", "-m", "one"])?;
-    let c1 = git_in(src.path(), &["rev-parse", "HEAD"])?
-        .trim()
-        .to_string();
-    std::fs::write(src.path().join("g.txt"), "two\n")?;
-    git_in(src.path(), &["add", "."])?;
-    git_in(src.path(), &["commit", "-q", "-m", "two"])?;
-    let c2 = git_in(src.path(), &["rev-parse", "HEAD"])?
-        .trim()
-        .to_string();
-    let id = walgit_git::RepoId::new("o", "r")?;
-    let h = step!("open", server.state.registry.open(&id))?;
-    let now = std::time::SystemTime::now();
-    let hour = std::time::Duration::from_hours(1);
-    // History with explicit times: c1 ten days ago (so a weekly slot with state
-    // exists — a full with no state is cut from now), c2 six hours ago, nothing since.
-    let pack_of = |revs: &str| -> anyhow::Result<Vec<u8>> {
-        let out = std::process::Command::new("sh")
-            .arg("-c")
-            .arg(format!(
-                "git rev-list --objects {revs} | git pack-objects --stdout"
-            ))
-            .current_dir(src.path())
-            .output()?;
-        Ok(out.stdout)
-    };
-    let txn = |name: &str, old: &str, new: &str| walgit_proto::v1::RefTransaction {
-        updates: vec![walgit_proto::v1::RefUpdate {
-            name: name.into(),
-            old_oid: old.into(),
-            new_oid: new.into(),
-            ..Default::default()
-        }],
-        ..Default::default()
-    };
-    let ingest = |bytes: Vec<u8>| async {
-        h.local()
-            .ingest_pack(
-                std::io::Cursor::new(bytes),
-                walgit_git::IngestOptions {
-                    fsck: false,
-                    max_bytes: None,
-                    thin: false,
-                },
-            )
-            .await
-            .unwrap()
-            .unwrap()
-    };
-    let p1 = ingest(pack_of(&c1)?).await;
-    step!(
-        "c1 ten days ago",
-        h.publish_push_at(
-            Some(p1),
-            txn("refs/heads/main", "", &c1),
-            HashMap::default(),
-            now - 240 * hour
+/// Manual force and full-cut requests obey committed repository disablement.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn manual_pack_work_cannot_override_saved_disablement() -> anyhow::Result<()> {
+    let server = Server::start_with_tweak(|cfg| cfg.packs.enabled = true).await?;
+    server.put_repo("o", "disabled").await?;
+    let id = walgit_git::RepoId::new("o", "disabled")?;
+    let handle = server.state.registry.open(&id).await?;
+    handle
+        .publish_settings("[packs]\nenabled = false\n", "admin", "pause maintenance")
+        .await?;
+    let before = handle.manifest();
+    for rebuild_base in [false, true] {
+        let error = walgit_server::ops::compact_repo(
+            &handle,
+            walgit_server::ops::CompactRequest {
+                force: true,
+                rebuild_base,
+            },
+            &walgit_server::ops::noop_log,
         )
-    )?;
-    let p2 = ingest(pack_of(&format!("{c2} ^{c1}"))?).await;
-    step!(
-        "c2 six hours ago",
-        h.publish_push_at(
-            Some(p2),
-            txn("refs/heads/main", &c1, &c2),
-            HashMap::default(),
-            now - 6 * hour
-        )
-    )?;
-    step!("sync", h.sync())?;
-
-    // Weekly at the last Sunday before c2 (state as of then: c1).
-    let weekly = server
-        .state
-        .cfg
-        .bundles
-        .strategy
-        .iter()
-        .find(|s| s.name == "weekly")
-        .unwrap()
-        .clone();
-    let sunday = walgit_bundle::slots::last_slot_at_or_before(&weekly, now - 48 * hour)?.unwrap();
-    let mut params = std::collections::HashMap::new();
-    params.insert("strategy".to_string(), "weekly".to_string());
-    params.insert("slot".to_string(), sunday.to_string());
-    let t = walgit_server::ops::start(server.state.clone(), id.clone(), "bundle", params)
         .await
-        .map_err(|_| anyhow::anyhow!("op start"))?;
-    assert!(t.wait_done(std::time::Duration::from_secs(30)).await);
-
-    // Passes until idle: exactly ONE hourly (the slot that first sees c2); every
-    // later closed slot is recorded `unchanged since <that hourly>`.
-    for _ in 0..8 {
-        let report = step!("pass", walgit_server::maintain::run_pass(&server.state))?;
-        if report.units == 0 {
-            break;
-        }
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("disabled by the effective repository settings"),
+            "{error:#}"
+        );
     }
-    let list = walgit_bundle::ops::read_list(h.store())
-        .await?
-        .expect("list");
-    let hourlies: Vec<_> = list
-        .bundles
-        .iter()
-        .filter(|b| b.strategy == "hourly")
-        .collect();
-    let hourly = server
-        .state
-        .cfg
-        .bundles
-        .strategy
-        .iter()
-        .find(|s| s.name == "hourly")
-        .unwrap()
-        .clone();
-    let ctx = walgit_bundle::slots::PlanContext {
-        first_state: h.first_state_time(),
-        can_full: true,
-        can_incremental: true,
-        wrong_host_reason: None,
-    };
-    let rows = server
-        .state
-        .bundles
-        .plan(&id, std::time::SystemTime::now(), ctx)
-        .await?;
-    let dbg: Vec<_> = rows
-        .iter()
-        .filter(|r| r.strategy == "hourly")
-        .map(|r| (r.slot, format!("{:?}", r.status)))
-        .collect();
     assert_eq!(
-        hourlies.len(),
-        1,
-        "one hourly carries c2; the identical later slots are not cut: {:?}\nbundles={:?}\nskipped={:?}\nplan={dbg:#?}",
-        hourlies.iter().map(|b| (&b.id, b.slot)).collect::<Vec<_>>(),
-        list.bundles
-            .iter()
-            .map(|b| (&b.id, b.slot))
-            .collect::<Vec<_>>(),
-        list.skipped
-            .iter()
-            .map(|s| (s.slot, &s.reason))
-            .collect::<Vec<_>>()
+        handle.manifest(),
+        before,
+        "disabled requests changed committed state"
     );
-    assert_eq!(
-        hourlies[0]
-            .tips
-            .iter()
-            .map(|t| t.oid.as_str())
-            .collect::<Vec<_>>(),
-        vec![c2.as_str()]
-    );
-    let unchanged: Vec<_> = list
-        .skipped
-        .iter()
-        .filter(|s| s.reason.starts_with("unchanged since "))
-        .collect();
-    // With only the two newest slots ever planned (D21, 2026-08-22) that is the one slot after it —
-    // settled as unchanged once it is *closed* (120 s past its fire time); in the first two minutes of
-    // an hour it is still open and legitimately not recorded yet.
-    let other_slot = rows
-        .iter()
-        .filter(|r| r.strategy == "hourly" && r.slot != hourlies[0].slot)
-        .map(|r| r.slot)
-        .max();
-    let other_closed = other_slot.is_some_and(|s| {
-        walgit_bundle::slots::slot_closed(&hourly, s, std::time::SystemTime::now())
-    });
-    assert!(
-        !other_closed || !unchanged.is_empty(),
-        "the closed hour after it is skipped as unchanged: {:?}",
-        list.skipped
-            .iter()
-            .map(|s| (s.slot, &s.reason))
-            .collect::<Vec<_>>()
-    );
-    assert!(
-        unchanged.iter().all(
-            |s| s.reason == format!("unchanged since {}", hourlies[0].id)
-                && s.slot > hourlies[0].slot
-        ),
-        "{unchanged:?}"
-    );
-    // And the plan shows them so — nothing is re-measured.
-    let closed_missing = rows
-        .iter()
-        .filter(|r| {
-            r.strategy == "hourly"
-                && r.status == walgit_bundle::slots::SlotStatus::Missing
-                && walgit_bundle::slots::slot_closed(&hourly, r.slot, std::time::SystemTime::now())
-        })
-        .count();
-    assert_eq!(closed_missing, 0, "{rows:?}");
-    Ok(())
-}
-
-/// The blobless bundle family (`filter = "blob:none"` strategies): the weekly
-/// "history" bundle is the D18 history pack composed under a `@filter=blob:none`
-/// header, incrementals pack with `--filter=blob:none`; they are advertised ONLY
-/// at `bundles/list?filter=blob:none` (git does not match `bundle.<id>.filter`
-/// against the clone's filter — a full clone would swallow them). A
-/// `--filter=blob:none --bundle-uri=<that list>` clone seeds from them and
-/// fetches blobs lazily; a full clone with the protocol list never sees them.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn blobless_bundle_family_is_composed_from_the_history_pack_and_served_on_its_own_list()
--> anyhow::Result<()> {
-    use walgit_server::maintain::{Unit, next_unit, run_pass};
-    let server = step!(
-        "start",
-        Server::start_with_tweak(|c| {
-            c.server.roles = vec![
-                walgit_config::Role::Serve,
-                walgit_config::Role::Maintain,
-                walgit_config::Role::Compact,
-                walgit_config::Role::Bundle,
-            ];
-            c.maintenance.disk = walgit_config::MaintainerDisk::Ssd;
-            c.cache.mode = walgit_config::CacheMode::Disk;
-            c.bundles.enabled = true;
-            c.bundles.min_commits = 1;
-            c.bundles.strategy.truncate(1); // weekly (full, unfiltered)
-            let weekly = c.bundles.strategy[0].clone();
-            c.bundles.strategy.push(walgit_config::BundleStrategy {
-                name: "weekly-history".into(),
-                filter: Some("blob:none".into()),
-                ..weekly.clone()
-            });
-            c.bundles.strategy.push(walgit_config::BundleStrategy {
-                name: "hourly-history".into(),
-                kind: walgit_config::BundleKind::Incremental,
-                base: Some("weekly-history".into()),
-                schedule: "0 0 * * * *".into(),
-                keep: 0,
-                filter: Some("blob:none".into()),
-                backfill_max: 0,
-                ..weekly
-            });
-            c.compaction.enabled = true;
-            c.maintenance.checkpoints = false;
-            c.maintenance.fsck_interval = std::time::Duration::ZERO;
-        })
-    )?;
-    step!("put repo", server.put_repo("o", "r"))?;
-    let src = tempfile::tempdir()?;
-    git_in(src.path(), &["init", "-q", "-b", "main"])?;
-    git_in(src.path(), &["config", "user.email", "t@t"])?;
-    git_in(src.path(), &["config", "user.name", "Tester"])?;
-    std::fs::write(src.path().join("f.txt"), "one\n")?;
-    git_in(src.path(), &["add", "."])?;
-    git_in(src.path(), &["commit", "-q", "-m", "one"])?;
-    // A large repository's shape: an imported tier-2 base + ref snapshot, then a push.
-    let id = walgit_git::RepoId::new("o", "r")?;
-    let h = step!("open", server.state.registry.open(&id))?;
-    let c1 = git_in(src.path(), &["rev-parse", "HEAD"])?
-        .trim()
-        .to_string();
-    let packs = tempfile::tempdir()?;
-    let out = std::process::Command::new("git")
-        .current_dir(src.path())
-        .args([
-            "pack-objects",
-            "--revs",
-            &format!("{}/pack", packs.path().display()),
-        ])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .spawn()
-        .and_then(|mut c| {
-            use std::io::Write;
-            c.stdin
-                .take()
-                .unwrap()
-                .write_all(format!("{c1}\n").as_bytes())?;
-            c.wait_with_output()
-        })?;
-    let sha = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    step!("sync0", h.sync())?;
-    step!(
-        "import base",
-        h.add_pack(
-            &packs.path().join(format!("pack-{sha}.pack")),
-            &packs.path().join(format!("pack-{sha}.idx")),
-            2,
-            None
-        )
-    )?;
-    let txn = walgit_proto::v1::RefTransaction {
-        updates: vec![walgit_proto::v1::RefUpdate {
-            name: "refs/heads/main".into(),
-            old_oid: String::new(),
-            new_oid: c1.clone(),
-            ..Default::default()
-        }],
-        ..Default::default()
-    };
-    step!(
-        "import refs",
-        h.publish_push_synced(None, txn, HashMap::default())
-    )?;
-    std::fs::write(src.path().join("f2.txt"), "one and a half\n")?;
-    git_in(src.path(), &["add", "."])?;
-    git_in(src.path(), &["commit", "-q", "-m", "one.5"])?;
-    git(
-        &["push", "-q", &server.repo_url("o", "r"), "main"],
-        src.path(),
-    )?;
-    step!("sync", h.sync())?;
-
-    // Passes until idle: base rebuild (base + D18 history pack), weekly compose,
-    // weekly-history compose (of the history pack).
-    for _ in 0..12 {
-        let u = next_unit(&server.state, &id).await?;
-        if u == Unit::Idle {
-            break;
-        }
-        let _ = step!("pass", run_pass(&server.state))?;
-    }
-    step!("sync2", h.sync())?;
-    let m = h.manifest();
-    let base = walgit_wal::base_pack(&m).expect("base").clone();
-    let hist = m
-        .packs
-        .iter()
-        .find(|p| {
-            p.kind == walgit_proto::v1::PackKind::History as i32 && p.derived_from == base.checksum
-        })
-        .expect("history pack")
-        .clone();
-    let list = walgit_bundle::ops::read_list(h.store())
-        .await?
-        .expect("list");
-    let weekly = list
-        .bundles
-        .iter()
-        .find(|b| b.strategy == "weekly")
-        .expect("weekly");
-    let weekly_h = list
-        .bundles
-        .iter()
-        .find(|b| b.strategy == "weekly-history")
-        .expect("weekly-history");
-    assert_eq!(weekly.filter, "");
-    assert_eq!(weekly_h.filter, "blob:none");
-    assert!(
-        weekly.size > base.pack_size && weekly.size < base.pack_size + 4096,
-        "weekly = header ∘ base"
-    );
-    assert!(
-        weekly_h.size > hist.pack_size && weekly_h.size < hist.pack_size + 4096,
-        "weekly-history = header ∘ history pack: {} vs {}",
-        weekly_h.size,
-        hist.pack_size
-    );
-    // Header: v3 with the filter capability.
-    let head = server
-        .get_text(
-            &format!("/o/r.git/{}", weekly_h.key),
-            &[("Range", "bytes=0-63")],
-        )
-        .await?;
-    assert!(
-        head.starts_with("# v3 git bundle\n@filter=blob:none\n"),
-        "{head:?}"
-    );
-
-    // A blobless incremental on it ("now" build): new commit with a new blob.
-    std::fs::write(
-        src.path().join("g.txt"),
-        "two — a blob the incremental must NOT carry\n",
-    )?;
-    git_in(src.path(), &["add", "."])?;
-    git_in(src.path(), &["commit", "-q", "-m", "two"])?;
-    git(
-        &["push", "-q", &server.repo_url("o", "r"), "main"],
-        src.path(),
-    )?;
-    step!("sync3", h.sync())?;
-    let inc = step!(
-        "hourly-history build",
-        server.state.bundles.build(&id, "hourly-history")
-    )?;
-    assert_eq!(
-        (inc.kind.as_str(), inc.filter.as_str(), inc.base_id.as_str()),
-        ("incremental", "blob:none", weekly_h.id.as_str())
-    );
-    let head = server
-        .get_text(&format!("/o/r.git/{}", inc.key), &[("Range", "bytes=0-63")])
-        .await?;
-    assert!(
-        head.starts_with("# v3 git bundle\n@filter=blob:none\n"),
-        "{head:?}"
-    );
-
-    // Two lists, one family each.
-    let plain = server.get_text("/o/r.git/bundles/list", &[]).await?;
-    let blobless = server
-        .get_text("/o/r.git/bundles/list?filter=blob:none", &[])
-        .await?;
-    assert!(
-        plain.contains("[bundle \"weekly-")
-            && !plain.contains("history")
-            && !plain.contains("filter ="),
-        "{plain}"
-    );
-    assert!(
-        blobless.contains("[bundle \"weekly-history-")
-            && blobless.contains("[bundle \"hourly-history-")
-            && !blobless.contains("[bundle \"weekly-1"),
-        "{blobless}"
-    );
-    assert_eq!(
-        blobless.matches("    filter = blob:none\n").count(),
-        2,
-        "{blobless}"
-    );
-    let v2 = server
-        .state
-        .bundles
-        .protocol_v2_lines(&id, &server.base_url)
-        .await?;
-    assert!(
-        v2.iter().any(|l| l.starts_with("bundle.weekly-1")
-            || l.starts_with("bundle.weekly-") && !l.contains("history"))
-            && !v2.iter().any(|l| l.contains("history")),
-        "{v2:?}"
-    );
-
-    // A blobless clone seeded from the blobless list: promisor packs from the
-    // bundles, blobs missing until checkout fetches them lazily.
-    let tmp = tempfile::tempdir()?;
-    let c = tmp.path().join("blobless");
-    git(
-        &[
-            "clone",
-            "-q",
-            "--filter=blob:none",
-            "--no-checkout",
-            &format!(
-                "--bundle-uri={}/o/r.git/bundles/list?filter=blob:none",
-                server.base_url
-            ),
-            &server.repo_url("o", "r"),
-            c.to_str().unwrap(),
-        ],
-        tmp.path(),
-    )?;
-    let promisors = std::fs::read_dir(c.join(".git/objects/pack"))?
-        .filter(|e| {
-            e.as_ref()
-                .unwrap()
-                .path()
-                .extension()
-                .is_some_and(|x| x == "promisor")
-        })
-        .count();
-    assert!(
-        promisors >= 2,
-        "bundle packs unbundled as promisor packs: {promisors}"
-    );
-    let missing = git_in(&c, &["rev-list", "--objects", "--all", "--missing=print"])?;
-    assert!(
-        missing.lines().any(|l| l.starts_with('?')),
-        "blobs are NOT in the blobless bundles:\n{missing}"
-    );
-    git_in(&c, &["checkout", "-q", "main"])?; // lazy blob fetch from the server
-    assert_eq!(
-        std::fs::read_to_string(c.join("g.txt"))?,
-        "two — a blob the incremental must NOT carry\n"
-    );
-    git_in(&c, &["fsck", "--connectivity-only"])?;
-
-    // A full clone with bundle-uri via the protocol never sees the family.
-    let f = tmp.path().join("full");
-    git(
-        &[
-            "-c",
-            "transfer.bundleURI=true",
-            "clone",
-            "-q",
-            &server.repo_url("o", "r"),
-            f.to_str().unwrap(),
-        ],
-        tmp.path(),
-    )?;
-    let promisors = std::fs::read_dir(f.join(".git/objects/pack"))?
-        .filter(|e| {
-            e.as_ref()
-                .unwrap()
-                .path()
-                .extension()
-                .is_some_and(|x| x == "promisor")
-        })
-        .count();
-    assert_eq!(promisors, 0, "no promisor pack in a full clone");
-    let missing = git_in(&f, &["rev-list", "--objects", "--all", "--missing=print"])?;
-    assert!(!missing.lines().any(|l| l.starts_with('?')), "{missing}");
-    git_in(&f, &["fsck"])?;
-    Ok(())
-}
-
-/// D21 (2026-08-22): the list lists `keep` fulls and the two newest incrementals per
-/// strategy — and the maintainer brings an existing list to that shape on its next pass,
-/// deleting the pruned objects, even when the repository is idle and publishes nothing
-/// (acme/walgit sat at 1 weekly + 3 dailies + 39 hourlies: 43 downloads
-/// per fresh clone).
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn maintainer_pass_brings_an_overgrown_bundle_list_to_retention() -> anyhow::Result<()> {
-    use prost::Message;
-    use walgit_store::{ObjectStore, ObjectStoreExt, PutMode};
-    let server = step!(
-        "start",
-        Server::start_with_tweak(|c| {
-            c.server.roles = vec![walgit_config::Role::Serve, walgit_config::Role::Maintain];
-            c.bundles.enabled = true;
-            // The D21 shape this test pins (the default chains the dailies since 2026-08-22).
-            for s in &mut c.bundles.strategy {
-                s.chain = false;
-            }
-        })
-    )?;
-    step!("put repo", server.put_repo("o", "r"))?;
-    let id = walgit_git::RepoId::new("o", "r")?;
-    let store =
-        walgit_store::Prefixed::new(server.state.registry.store().clone(), id.store_prefix());
-    // Seed: one weekly, three dailies on it, 13 hourlies on each daily (objects = dummy bytes).
-    let mut list = walgit_proto::v1::BundleList {
-        mode: "all".into(),
-        heuristic: "creationToken".into(),
-        ..Default::default()
-    };
-    let entry =
-        |strategy: &str, kind: &str, slot: u64, base_id: &str| walgit_proto::v1::BundleEntry {
-            id: format!("{strategy}-{slot}"),
-            key: format!("bundles/{strategy}/{slot}.bundle"),
-            strategy: strategy.into(),
-            kind: kind.into(),
-            creation_token: slot,
-            slot,
-            base_id: base_id.into(),
-            ..Default::default()
-        };
-    let w0 = 1_787_000_400u64; // a Sunday 23:00-ish epoch; only ordering matters here
-    list.bundles.push(entry("weekly", "full", w0, ""));
-    for d in 1..=3u64 {
-        let ds = w0 + d * 86_400;
-        list.bundles
-            .push(entry("daily", "incremental", ds, &format!("weekly-{w0}")));
-        for h in 1..=13u64 {
-            list.bundles.push(entry(
-                "hourly",
-                "incremental",
-                ds + h * 3600,
-                &format!("daily-{ds}"),
-            ));
-        }
-    }
-    assert_eq!(list.bundles.len(), 43);
-    for b in &list.bundles {
-        step!(
-            "seed object",
-            store.put_bytes(&b.key, b"bundle".as_slice(), PutMode::Create)
-        )?;
-    }
-    step!(
-        "seed list",
-        store.put_bytes(
-            walgit_proto::keys::BUNDLE_LIST,
-            list.encode_to_vec(),
-            PutMode::Create
-        )
-    )?;
-    let text = step!("list before", server.get_text("/o/r.git/bundles/list", &[]))?;
-    assert_eq!(text.matches("uri = ").count(), 43, "{text}");
-
-    // One maintainer pass (whatever unit it picks) applies retention first.
-    let _ = step!("pass", walgit_server::maintain::run_pass(&server.state))?;
-    let after = walgit_bundle::ops::read_list(&store).await?.unwrap();
-    let ids: Vec<&str> = after.bundles.iter().map(|b| b.id.as_str()).collect();
-    assert_eq!(after.bundles.len(), 5, "{ids:?}");
-    let d2 = w0 + 2 * 86_400;
-    let d3 = w0 + 3 * 86_400;
-    for want in [
-        format!("weekly-{w0}"),
-        format!("daily-{d2}"),
-        format!("daily-{d3}"),
-        format!("hourly-{}", d3 + 12 * 3600),
-        format!("hourly-{}", d3 + 13 * 3600),
-    ] {
-        assert!(ids.contains(&want.as_str()), "{want} missing from {ids:?}");
-    }
-    // Pruned objects are gone, kept ones stay.
-    assert!(
-        step!(
-            "pruned gone",
-            store.head(&format!("bundles/hourly/{}.bundle", d2 + 3600))
-        )?
-        .is_none()
-    );
-    assert!(
-        step!(
-            "kept stays",
-            store.head(&format!("bundles/hourly/{}.bundle", d3 + 13 * 3600))
-        )?
-        .is_some()
-    );
-    // Idempotent: a second pass changes nothing.
-    let _ = step!("pass 2", walgit_server::maintain::run_pass(&server.state))?;
-    let again = walgit_bundle::ops::read_list(&store).await?.unwrap();
-    assert_eq!(again.bundles.len(), 5);
     Ok(())
 }

@@ -895,7 +895,7 @@ async fn gcs_control_plane_not_starved_by_bulk() {
         if let Some(repo_root) = big_key.rsplit_once("/wal/").map(|(a, _)| a) {
             for small in [
                 format!("{repo_root}/manifest.pb"),
-                format!("{repo_root}/bundles/list.pb"),
+                format!("{repo_root}/policy.json"),
             ] {
                 let t = std::time::Instant::now();
                 let _ = store.get(&small, GetOptions::default()).await;

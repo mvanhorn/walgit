@@ -4,15 +4,15 @@
 # byte and authenticates every request. Put nginx in front when you want one of:
 #
 #   1. Public TLS with your own certificates / ACME client, HTTP/2 + HTTP/3, rate limits.
-#   2. **Byte offload with a disk cache (`X-Accel-Redirect`)**: clone bundles and LFS
+#   2. **Byte offload with a disk cache (`X-Accel-Redirect`)**: immutable packs and LFS
 #      objects are big, immutable and content-addressed. With this config walgit still
 #      does auth, existence, validators and 304s, but answers the *bytes* with an
 #      internal redirect; nginx fetches the object from the bucket itself (S3 or GCS),
-#      slices ranges, and keeps it on local disk. A 30 GB weekly bundle then costs the
+#      slices ranges, and keeps it on local disk. A large immutable object then costs the
 #      walgit process nothing per download, and the second download is served from the
 #      edge's disk.
 #   3. One `auth_request` verdict per credential cached for a few minutes, so a clone
-#      that opens many connections (every bundle is its own `git-remote-https`) does not
+#      that opens many connections (each static download uses `git-remote-https`) does not
 #      verify the same token many times.
 #   4. Routing several repositories to several walgit hosts by the repository prefix
 #      (`/<owner>/<repo>` is the only routing key walgit needs; nothing else).
@@ -49,7 +49,7 @@ http {
     # ---- walgit upstream(s) -------------------------------------------------------
     # One box: one upstream. Several boxes: keep one upstream per group of repositories
     # and route with `location ~ ^/acme/monorepo([./?]|$)` blocks below (the repo prefix
-    # is the routing key; `.git`, `/api`, bundles and LFS all live under it).
+    # is the routing key; `.git`, `/api`, packs and LFS all live under it).
     upstream walgit {
         server 127.0.0.1:8080;          # walgit serve, server.tls.mode = "off" (h2c)
         keepalive 64;
@@ -141,7 +141,7 @@ http {
             proxy_set_header Connection "";
         }
 
-        # ---- everything else: repositories, API, UI, git, bundles, LFS -------------------
+        # ---- everything else: repositories, API, UI, git, packs, LFS -------------------
         location / {
             auth_request /_auth/check;
             error_page 401 = @need_signin;

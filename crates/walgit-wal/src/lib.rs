@@ -2,8 +2,11 @@
 //! catch-up/materialize of local repos, ref snapshots. See AGENTS.md §2 and AGENTS.md §2.
 
 mod checkpoint;
+mod classification;
+mod closure;
 mod error;
 mod handle;
+mod index_cache;
 pub mod lockwait;
 mod log_reader;
 pub mod progress;
@@ -11,12 +14,14 @@ mod publish;
 mod registry;
 pub mod remote;
 pub mod snapshot;
+mod snapshots;
 mod state;
 mod store_proto;
 mod sync;
 pub mod tasks;
 
 pub use checkpoint::{CheckpointTrigger, checkpoint_due};
+pub use classification::PackClassification;
 pub use error::{CoordError, RefError, WalError};
 pub use handle::{ObjectAccess, RepoHandle};
 pub use progress::{Progress, Reporter};
@@ -24,6 +29,7 @@ pub use publish::PublishResult;
 pub use registry::{EvictReport, Registry};
 pub use remote::{BlockCache, RemotePacks};
 pub use snapshot::{Snapshot, materialize_at, snapshot_at};
+pub use snapshots::{CoverageSnapshot, FetchView, PublicationView, validate_manifest};
 pub use sync::{PackPlan, ReadGuard, SyncLevel};
 pub use tasks::{Begin, TaskHandle, TaskRecord, Tasks};
 

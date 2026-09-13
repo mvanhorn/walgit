@@ -18,7 +18,7 @@ export default defineConfig(({ command }) => ({
       "/api-browser/": process.env.WALGIT_URL ?? "http://127.0.0.1:8080",
       "/services/api/": process.env.WALGIT_URL ?? "http://127.0.0.1:8080",
       "^/[^/]+/[^/]+/api(-browser)?(/|$)": process.env.WALGIT_URL ?? "http://127.0.0.1:8080",
-      "^/[^/]+/[^/]+(\\.git)?/(info/refs|git-upload-pack|git-receive-pack|bundles/)": process.env.WALGIT_URL ?? "http://127.0.0.1:8080",
+      "^/[^/]+/[^/]+(\\.git)?/(info/refs|git-upload-pack|git-receive-pack)": process.env.WALGIT_URL ?? "http://127.0.0.1:8080",
     },
   },
   build: {

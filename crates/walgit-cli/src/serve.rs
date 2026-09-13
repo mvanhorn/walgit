@@ -1,19 +1,8 @@
-//! `walgit serve` — run the HTTP server with optional compaction/bundle loops.
+//! `walgit serve` — run the HTTP server and configured maintenance loops.
 //!
-//! Opens the object store from config, builds `AppState` (which constructs the
-//! WAL registry, bundler, authenticator, semaphores, and metrics), then calls
-//! `walgit_server::serve`. When the instance's roles include `compact` and/or
-//! `bundle`, background loops are spawned:
-//!
-//!   * **compact loop** — every 60s, for every repo in `registry.list()`, if
-//!     the compaction trigger is met (tier-0 packs ≥ `trigger_packs` or bytes
-//!     ≥ `trigger_bytes`) and the compaction lease can be acquired, run
-//!     `LocalRepo::repack(geometric)` → `RepoHandle::publish_compact`.
-//!   * **bundle loop** — every 60s, `Bundler::run_all_due`.
-//!   * **maintain** role — `walgit_server::maintain::run_loop`: checkpoint-if-due
-//!     (refs-level), bundles-if-due and geometric compaction for every repo, each
-//!     as a task. It subsumes the two loops above (they are skipped when the
-//!     instance is a maintainer so work is not done twice).
+//! Opens the object store and constructs the WAL registry, authenticator,
+//! semaphores and metrics. The maintain role runs bounded maintenance tasks
+//! and upstream following; otherwise the compact role runs bounded pack lifecycle units.
 
 use std::sync::Arc;
 
@@ -33,7 +22,7 @@ pub async fn run(cfg: &Arc<Config>) -> Result<()> {
     // Ensure the cache directory exists.
     std::fs::create_dir_all(&cfg.cache.dir).ok();
 
-    // AppState::new constructs the registry, bundler, auth, semaphores, metrics.
+    // AppState::new constructs the registry, auth, semaphores, metrics.
     let state = AppState::new(cfg.clone(), store).await?;
 
     // Spawn background loops for non-serving roles.
@@ -58,14 +47,6 @@ pub async fn run(cfg: &Arc<Config>) -> Result<()> {
         let c = cfg.clone();
         bg_handles.push(tokio::spawn(async move {
             compact_loop(reg, c).await;
-        }));
-    }
-
-    if !maintainer && cfg.has_role(Role::Bundle) {
-        let b = state.bundles.clone();
-        let c = cfg.clone();
-        bg_handles.push(tokio::spawn(async move {
-            bundle_loop(b, c).await;
         }));
     }
 
@@ -102,20 +83,20 @@ pub async fn run(cfg: &Arc<Config>) -> Result<()> {
 
 /// Compaction loop: every 60s, check each repo for compaction triggers.
 async fn compact_loop(registry: Arc<walgit_wal::Registry>, cfg: Arc<Config>) {
-    if !cfg.compaction.enabled {
-        info!("compaction disabled by config, loop exiting");
+    if !cfg.packs.enabled {
+        info!("pack maintenance disabled by config, loop exiting");
         return;
     }
     let interval = std::time::Duration::from_mins(1);
     loop {
         tokio::time::sleep(interval).await;
-        if let Err(e) = run_compaction_pass(&registry, &cfg).await {
+        if let Err(e) = run_compaction_pass(&registry).await {
             warn!(error = %e, "compaction pass failed");
         }
     }
 }
 
-async fn run_compaction_pass(registry: &walgit_wal::Registry, cfg: &Config) -> anyhow::Result<()> {
+async fn run_compaction_pass(registry: &walgit_wal::Registry) -> anyhow::Result<()> {
     let repos = registry.list().await?;
     for id in repos {
         let handle = match registry.open(&id).await {
@@ -133,7 +114,6 @@ async fn run_compaction_pass(registry: &walgit_wal::Registry, cfg: &Config) -> a
         let log = |line: String| info!(repo = %id, "{line}");
         match walgit_server::ops::compact_repo(
             &handle,
-            cfg,
             walgit_server::ops::CompactRequest::default(),
             &log,
         )
@@ -144,20 +124,4 @@ async fn run_compaction_pass(registry: &walgit_wal::Registry, cfg: &Config) -> a
         }
     }
     Ok(())
-}
-
-/// Bundle loop: every 60s, run all due bundle strategies.
-async fn bundle_loop(bundler: Arc<walgit_bundle::Bundler>, cfg: Arc<Config>) {
-    if !cfg.bundles.enabled {
-        info!("bundles disabled by config, loop exiting");
-        return;
-    }
-    let interval = std::time::Duration::from_mins(1);
-    loop {
-        tokio::time::sleep(interval).await;
-        let now = std::time::SystemTime::now();
-        if let Err(e) = bundler.run_all_due(now).await {
-            warn!(error = %e, "bundle pass failed");
-        }
-    }
 }

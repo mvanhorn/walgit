@@ -14,7 +14,7 @@ function kindLabel(kind: string): string {
 
 /**
  * What the serving instance is doing to this repository right now
- * (materializing packs, indexing remote packs, checkpoint, bundle…), as a
+ * (materializing packs, indexing remote packs, checkpoint…), as a
  * compact indicator in the repo header: spinner + the name of the job (+N
  * more) + its percent. Clicking it opens a dropdown with every running task,
  * its latest progress, and the tasks that just finished. Polls `…/tasks`

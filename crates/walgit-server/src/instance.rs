@@ -68,32 +68,70 @@ fn cgroup_cpus() -> Option<usize> {
     }
     None
 }
+/// Machine type as resolved once by [`init_machine_type`]; unset until then, and
+/// on every host that never probes (dev, tests, off GCP), which reads as `None`.
+static MACHINE_TYPE: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+
+const MACHINE_TYPE_URL: &str =
+    "http://metadata.google.internal/computeMetadata/v1/instance/machine-type";
+
+/// Resolve the GCE machine type once, at startup, off the request path
+/// (principle VI: `info()` runs on tokio workers under every health probe).
+///
+/// Only the SSD host ever shows a machine type (`info()` puts it in the shape
+/// line), so only the SSD host probes, as before; every other host sends
+/// nothing. The whole probe is capped at 300 ms, so an SSD host that is not on
+/// GCE waits at most that, once, before it starts serving.
+pub async fn init_machine_type(cfg: &walgit_config::Config) {
+    if !is_ssd_host(cfg) {
+        return;
+    }
+    let _ = MACHINE_TYPE.set(fetch_machine_type().await);
+}
+
+/// The same reading of `WALGIT_INSTANCE_KIND` and `maintenance.disk` that
+/// [`info`] uses to call a host `ssd`.
+fn is_ssd_host(cfg: &walgit_config::Config) -> bool {
+    match std::env::var("WALGIT_INSTANCE_KIND")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .as_deref()
+    {
+        Some("ssd") => true,
+        Some("serverless" | "dev") => false,
+        _ => cfg.maintenance.disk == walgit_config::MaintainerDisk::Ssd,
+    }
+}
+
+/// One GET at the metadata server, 300 ms for the whole thing. The value comes
+/// back as a path (`projects/1234/machineTypes/c3-standard-176-lssd`); the last
+/// segment is the machine type, and an empty answer is no answer.
+async fn fetch_machine_type() -> Option<String> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_millis(300))
+        .build()
+        .ok()?;
+    let resp = client
+        .get(MACHINE_TYPE_URL)
+        .header("Metadata-Flavor", "Google")
+        .send()
+        .await
+        .ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let body = resp.text().await.ok()?;
+    body.trim()
+        .rsplit('/')
+        .next()
+        .map(std::string::ToString::to_string)
+        .filter(|m| !m.is_empty())
+}
+
+/// The resolved machine type. A read of the cell and nothing else: handlers
+/// never probe.
 fn gce_machine_type() -> Option<String> {
-    // Cached once; 300 ms budget; only meaningful on GCE VMs (a serverless host answers
-    // the metadata server too but has no machine-type).
-    static MT: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
-    MT.get_or_init(|| {
-        let out = std::process::Command::new("curl")
-            .args([
-                "-sf",
-                "-m",
-                "0.3",
-                "-H",
-                "Metadata-Flavor: Google",
-                "http://metadata.google.internal/computeMetadata/v1/instance/machine-type",
-            ])
-            .output()
-            .ok()?;
-        if !out.status.success() {
-            return None;
-        }
-        let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        s.rsplit('/')
-            .next()
-            .map(std::string::ToString::to_string)
-            .filter(|m| !m.is_empty())
-    })
-    .clone()
+    MACHINE_TYPE.get().cloned().flatten()
 }
 fn gib(b: u64) -> String {
     let g = b as f64 / (1u64 << 30) as f64;
@@ -197,4 +235,31 @@ pub fn server_header(cfg: &walgit_config::Config) -> &'static str {
         clean
     })
     .as_str()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{gce_machine_type, init_machine_type, is_ssd_host};
+
+    /// A host that is not the SSD host never probes: no name to resolve, no
+    /// network, nothing cached, so `info()` keeps the plain cpu/memory shape.
+    #[tokio::test]
+    async fn init_machine_type_probes_only_on_the_ssd_host() {
+        if std::env::var("WALGIT_INSTANCE_KIND").as_deref() == Ok("ssd") {
+            return; // This runner calls itself the SSD host: the probe is meant to run.
+        }
+        let cfg = walgit_config::Config::default(); // maintenance.disk = tmpfs
+        assert!(!is_ssd_host(&cfg));
+        let started = std::time::Instant::now();
+        init_machine_type(&cfg).await;
+        let took = started.elapsed();
+        assert!(
+            took < std::time::Duration::from_millis(100),
+            "the metadata server was contacted from a non-SSD host (took {took:?})"
+        );
+        assert!(
+            gce_machine_type().is_none(),
+            "nothing should be cached when the probe never ran"
+        );
+    }
 }

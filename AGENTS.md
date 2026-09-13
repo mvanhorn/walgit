@@ -11,7 +11,7 @@ and the working rules (§5). Reading order starts at `GOAL.md`; §0 maps every o
 > because the bucket is the repository; everything else is disposable. If you find yourself writing "still
 > accepted for …" or "legacy", stop and remove the thing instead.
 
-walgit serves git over smart HTTP (v0/v2), receive-pack, upload-pack, bundle-uri, LFS and a browsing web UI,
+walgit serves git over smart HTTP (v0/v2), receive-pack, upload-pack, LFS and a browsing web UI,
 written in Rust, from disposable hosts whose only durable state is an object-store bucket. The reference workload
 it was built against is a 57 GiB / 73 M-object / 1.4 M-commit / 466 k-ref monorepo with LFS, served from
 machines whose "disk" is 20 GiB of tmpfs, next to a long tail of small repositories. The design follows Cursor's
@@ -24,15 +24,16 @@ machines whose "disk" is 20 GiB of tmpfs, next to a long tail of small repositor
 | `GOAL.md` | Everyone, first. What walgit is for, the acceptance table, what we do not optimise for. |
 | `AGENTS.md` (this) | Everyone. Constraints §1, WAL §2, principles §3, decisions §4, working rules §5. |
 | `README.md` | The introduction: why (the Cursor lineage), what it does, how it works briefly, running it, invariants. |
-| `docs/BUNDLE_URI_DESIGN.md` | Anyone touching bundles, the scheduler, base rebuilds, or big-repo clone/fetch UX. Design of record; normative config in §4. |
-| `docs/ROUNDTRIPS.md` | **Anyone touching a protocol that talks to the bucket** (publish, sync, checkpoints, compaction/leases, bundles, remote reader, store backends). Round trips are the cost model; correct is not sufficient. |
+| `docs/PACKFILE_URI_DESIGN.md` | Anyone implementing pack groups, proofs, lifecycle, or negotiated delivery. Design target; later layers require separate implementation and evidence. |
+| `docs/PACKFILE_MIGRATION.md` | Bundle removal, saved settings, writer cutover, clients and rollout gates. |
+| `docs/spec/README.md` | Bounded models, contract identifiers, result semantics, code/test map and remaining verification gaps. |
+| `docs/ROUNDTRIPS.md` | **Anyone touching a protocol that talks to the bucket** (publish, sync, checkpoints, compaction/leases, remote reader, store backends). Round trips are the cost model; correct is not sufficient. |
 | `docs/POLICY.md` | Anyone touching receive-pack authorization or writing a repo policy. Normative rule language. |
 | `docs/LFS.md` | Anyone touching LFS (`lfs.rs`, `lfs_upstream.rs`) or importing a repository whose LFS history lives elsewhere. |
 | `docs/INTEGRITY.md` | Anyone touching import, the maintainer's `fsck`/`repair` units, or seeing `connectivity: missing object` on a push. |
 | `docs/EVENTS.md` | Anyone changing WAL-derived ref events, the webhook bridge, consumer semantics or event cursors. |
 | `docs/CONTRACT.md` | When you touch a crate boundary. The cross-crate contract; *extend, don't rename*; code wins where they differ. |
 | `docs/reference/cursor-git-at-any-scale.md` | The source design, verbatim. Read once before touching WAL/publish/sync/placement. |
-| `docs/patches/README.md` | Git client patches (bundle filter matching) and the gate for advertising filtered bundle families together. |
 | `web/API.md` | UI/SDK authors and anyone changing `web/*.rs`. Wire contract, caching rules, SSE envelope, tasks, prefix-first lanes. |
 | `web/sdk/README.md` | Users of `repos.js`. |
 | `web/README.md` | Frontend engineers changing the React SPA, Vite build, SDK adapter, static assets, loading states. |
@@ -57,15 +58,14 @@ machines whose "disk" is 20 GiB of tmpfs, next to a long tail of small repositor
   (`wal.prefetch_max_bytes`).
 - **Object store facts**: ~60–80 ms per GET, ~100 MB/s per connection (stripe for more), conditional GET ~15 ms;
   same-object overwrite is serialized (~1 write/s) — a single CAS'd object is a throughput cap.
-- Operations that need real disk or hours of CPU (a full `repack -adb` of a monorepo, building its 30 GB weekly
-  bundle) run on a host with an SSD using the same binary and the same WAL/lease protocol (`walgit compact
+- Operations that need real disk or hours of CPU (a full `repack -adb` of a monorepo) run on a host with an SSD using the same binary and the same WAL/lease protocol (`walgit compact
   --base`, `walgit import`, the `maintain` role with `maintenance.disk = "ssd"`).
 
 ### 1.2 What follows
 - **Never fully materialize a big repo on a small instance.** Serve from the parts that fit: refs from the WAL
   (ref snapshot + log tail), pack *indexes* + bitmaps + commit-graph locally, pack *data* by range read from the
-  bucket (remote reader) or a read-only bucket mount, recent small packs locally. Clone bytes come from static
-  bundles, never through upload-pack.
+  bucket (remote reader) or a read-only bucket mount, recent small packs locally. Negotiated reusable packs are the static delivery target; during the removal phase clone/fetch
+  use dynamic upload-pack, subject to the existing bounded serving/placement limits.
 - **An instance must become useful in seconds**, cold: refs in < 1 s (one manifest GET + snapshot + tail),
   objects for the web UI within the first request (remote reader), fetch remainders from local small packs.
 - **Everything an instance computes that is immutable is cached for everyone**: in-process LRU and, where a
@@ -99,13 +99,9 @@ machines whose "disk" is 20 GiB of tmpfs, next to a long tail of small repositor
   exit 2 with the two things to do); writes `~/.config/git/<host>-token` (0600) and the credential helper
   `<host>-credential-helper` (`get` → `authtype=Bearer`; `store` keeps what git hands it; `erase` on a 401 deletes
   the token and names `/_auth/tokens`); sets exactly `credential.https://<host>.helper` = `""` then ours,
-  `transfer.bundleURI true`, `fetch.uriProtocols https`; unsets stale `fetch.bundleURI`/`extraHeader`; self-tests
+  `fetch.uriProtocols https`; self-tests
   (`/api/v1/me`, or `ls-remote` of `?repo=`). Recipes come from one place (`setup::Recipes`,
   `/services/setup.json`); the Clone menu, API page, overview and git error help render them.
-- **Bundle lists, two of them (D41)**: `bundles/list` is the *clone* list (fulls + chain; advertised in v2);
-  **`bundles/catchup`** is the same list without the fulls and is what every recipe records in `fetch.bundleURI`
-  — git's creationToken walk would otherwise download every full newer than the client's token.
-  Blobless: `…/list?filter=blob:none` / `…/catchup?filter=blob:none`.
 - **Host to host**: a front that forwards pushes to a broker presents `wal.push_broker_token` (or
   `WALGIT_BROKER_TOKEN`); the broker lists it in `tokens` and its principal in `trusted_forwarders`, so the end
   user travels in `X-Walgit-Principal`.
@@ -113,18 +109,16 @@ machines whose "disk" is 20 GiB of tmpfs, next to a long tail of small repositor
 
 ### 1.4 Requirements (the bar)
 - Full git surface: smart HTTP v0/v2, ls-refs with prefixes, fetch with filter/shallow/deepen/sideband-all,
-  receive-pack (atomic, delete, tags, push options, report-status-v2), bundle-uri (v2 command + static list),
+  receive-pack (atomic, delete, tags, push options, report-status-v2),
   LFS batch/basic transfer, `<owner>/<repo>` namespaces. Every read on every instance is as fresh as a fetch:
   push acknowledged ⇒ the next request anywhere sees it.
 - Cost must not scale with ref count on any hot path (O(1) `refs`, O(k) `resolve`, paged ref lists, prefix
   filtered advertisements) nor with pack size on a too-small instance.
-- Clones of big repos are **static**: the server hands out URLs, the bucket/CDN moves the bytes. `bundles.require`
-  rejects clones that skip bundle-uri, with the exact fix in the error text.
+- Target: large clones negotiate proven reusable packs plus the uncovered graph. The removal phase keeps
+  ordinary dynamic transfer; it does not implement or certify this acceleration.
 - Acceptance for the monorepo: cold instance serves `info/refs`/ls-refs/web `refs` in < 1 s; web UI renders
-  main's tree/blob/commits without packs on disk; `git clone` (bundle-uri) + `git fetch` work against a tmpfs
+  main's tree/blob/commits without packs on disk; `git clone` + `git fetch` work against a tmpfs
   host; `clone --filter=blob:none --depth=1 --sparse --single-branch` in seconds (reference: 2075 s → 8 s).
-  Bounded/CI clones must pass `-c transfer.bundleURI=false`: git downloads the advertised full bundle first
-  otherwise (the server cannot see the filter at bundle-uri time).
 
 ---
 
@@ -137,8 +131,7 @@ machines whose "disk" is 20 GiB of tmpfs, next to a long tail of small repositor
 | `log/<first_seq>.pb` | Immutable, uvarint-framed `LogEntry` frames: PUSH / REF_UPDATE (ref transaction + pack pointer), COMPACT (new pack, `supersedes[]`), CHECKPOINT, SETTINGS. Strictly increasing `seq`. One small object per publish batch. |
 | `wal/<checksum>.pack/.idx/.rev/.bitmap/.commit-graph` | Immutable packs, content-addressed by pack checksum: push packs (tier 0), compaction outputs (tier 1), the base (tier 2, bitmap'd), plus the side-files a reader needs. |
 | `checkpoints/<seq>/checkpoint.pb`, `refs.pb` | Folded state at `seq`: live pack set + full `RefSnapshot`. Cold start = snapshot + tail, never full replay. |
-| `bundles/list.pb`, `bundles/<strategy>/…` | bundle-uri artefacts + CAS'd list. |
-| `leases/<name>.pb` | CAS lease with TTL heartbeat: `compact`, `bundle:<strategy>`. The only cross-instance mutex. |
+| `leases/<name>.pb` | CAS lease with TTL heartbeat: `compact`. The only cross-instance mutex. |
 | `cache/api/v1/<sha1>.json` | Shared render cache of immutable web API answers. |
 | `policy.json` | Per-repo push policy (rule language, not on the WAL). `docs/POLICY.md`. Missing = allow-all. |
 | `fsck.pb` | Last connectivity audit (`FsckReport`), written by the maintainer's `fsck` unit, consumed by `repair` (`docs/INTEGRITY.md`). |
@@ -165,13 +158,13 @@ same ingest → connectivity → fast-forward → `publish_push` path, `principa
 Every request: conditional GET of `manifest.pb` (skippable for `wal.freshness_ttl`) → 304 serve / 200 apply.
 | Level | Brings | Used by |
 |---|---|---|
-| **Refs** | checkpoint `RefSnapshot` + every log entry's ref txn → `packed-refs`. No packs. | `info/refs`, `ls-refs`, `bundle-uri`, web `refs`/`resolve`/overview, read_log |
-| **Serve** (`sync()`) | Refs + the pack set as the instance can hold it: tiers < 2 and the **history pack** (D18) local; a tier-2 base as side-files (idx/rev/bitmap/commit-graph layer) + `pack-<sha>.pack` linked into a read-only bucket mount (`cache.store_mount`) or **remote-served** without one; midx over history + base | upload-pack, receive-pack, bundle builds, prewarm |
+| **Refs** | checkpoint `RefSnapshot` + every log entry's ref txn → `packed-refs`. No packs. | `info/refs`, `ls-refs`, web `refs`/`resolve`/overview, read_log |
+| **Serve** (`sync()`) | Refs + the pack set as the instance can hold it: tiers < 2 and the **history pack** (D18) local; a tier-2 base as side-files (idx/rev/bitmap/commit-graph layer) + `pack-<sha>.pack` linked into a read-only bucket mount (`cache.store_mount`) or **remote-served** without one; midx over history + base | upload-pack, receive-pack, prewarm |
 | **Full** (`sync_full()`) | Refs + every live pack local (striped parallel range downloads); only for repos that fit | base rebuilds (`compact --base`), geometric compaction |
 | **Objects** | Serve when the pack set fits `cache.max_bytes`, else Refs + **remote reader** → `ObjectAccess::{Local,Remote}` | web API object endpoints |
 Long syncs register as tasks (`materialize`, `remote-index`) and stream progress; pack work runs on the **bulk
 runtime** and never takes the refs phase's lock (D19). `check_fits` refuses to pull a pack set that cannot fit
-(TooLarge → 503 / pkt ERR with the bundle-uri fix). Local disk is a bounded LRU (`cache.max_bytes`,
+(TooLarge → 503 / pkt ERR with a truthful resource/placement explanation). Local disk is a bounded LRU (`cache.max_bytes`,
 `evict_idle_after`) in budget mode, watermark eviction in disk mode (D25).
 
 ### 2.4 Getting the most out of the WAL (the strategies)
@@ -200,44 +193,41 @@ runtime** and never takes the refs phase's lock (D19). `check_fits` refuses to p
 - **Never LIST on a hot path**; 404s are free; probe, don't list. Immutable objects get
   `Cache-Control: public, max-age=31536000, immutable` + strong ETag + Range everywhere (D10 static contract).
 
-### 2.5 Compaction (WAL + git), leader by lease
-- Assigned maintainers run **geometric** folding of fresh packs (tier 0 → tier 1, `git repack -d --geometric
-  --write-midx`) under `leases/compact.pb`; the result is a COMPACT entry; followers download the new pack and
-  drop superseded ones after in-flight readers finish. Triggers: `compaction.trigger_packs`, `trigger_bytes` —
-  and at least **two** fresh packs (one pack folds into itself).
-- **The base (tier 2, one pack + bitmap) is rebuilt only when the weekly bundle is built, and only on an ssd
-  host** — the maintainer's `BaseRebuild` unit, followed by the weekly slot's compose
-  (`docs/BUNDLE_URI_DESIGN.md §5`; `walgit compact --base` is the manual form). The rebuild runs in a scratch copy
-  under `<cache.dir>/_rebuild/` that survives the process and resumes after a restart iff the WAL head has not
-  moved (§5a); the serving copy is never rewritten. Invariant that makes serving cheap: *everything newer than the
-  base lives in small/medium packs that fit on every instance.*
-- **A fold never touches the base or a history pack** (`--keep-pack`), **a base is rebuilt only by the weekly
-  unit / `compact --base`**, and **a rebuild supersedes every other live pack** by the manifest, not by what git
-  happened to delete.
-- Superseded packs are retained `compaction.retention_superseded` (provenance window) then GC'd.
+### 2.5 Pack lifecycle (WAL + git), leader by lease
+- Assigned maintainers classify committed packs, fold compatible fresh families geometrically, freeze
+  buffers by size or settlement, and re-segment by frozen-byte ratios under `leases/compact.pb`.
+  Classification and coverage repair do not rewrite ordinary scoped push packs. Folds incorporate only
+  geometrically comparable buffers; a large buffer does not move merely because enough tiny pushes arrived.
+- History/blob families and retained indexed objects share one ordinary ODB. Inputs are copied into an
+  isolated attempt under `<cache.dir>/_pack-lifecycle/`, with an owned reader pin and process lock.
+  Disk-backed inventories preserve indexed objects, including unreachable objects; Git recomputes deltas
+  from path-bearing object lists with explicit thread/window-memory limits. Full materialization and
+  input/output headroom are required, so large jobs need sufficient disk placement.
+- Plan/step receipts are disposable progress. Outputs publish additively; only the final seal retires
+  exact captured inputs, rechecking live descriptors and policy on each CAS attempt. An overlapping
+  output checksum stays live. Readers retain local files until their guards release. MIDX bitmaps over
+  the readable inventory are verified before use. `walgit compact --base` forces the same conserving cut.
+- Superseded pack records and bucket bytes remain indefinitely for issued downloads; there is no timed GC knob.
 
 ### 2.5b Self-healing by construction (D22)
-Everything the maintainer produces — checkpoints, bundles per slot, compactions, retention — is a **pure function
-of (config, WAL state)**. The maintainer does not run schedules; it computes the *desired state* every pass and
-performs **one bounded unit of the most important missing work** (checkpoint → repair → missing weekly → missing
-dailies oldest-first → missing hourlies → compaction → rev-index → fsck audit), as a task, under a lease. An outage
-of any length leaves no permanent hole; a deleted or corrupt artefact is "missing" and rebuilt identically; config
-changes take effect by re-planning; there are no one-off backfill scripts.
+Everything the maintainer produces — checkpoints, compactions, integrity work and retention — derives from
+(config, WAL state). Each pass performs bounded useful work as a narrated task under the applicable lease.
+There are no bundle schedules or separate base-rebuild engine. Missing coverage requests proof repair,
+not a full cut; URI delivery remains a separately gated layer.
 
-### 2.6 Bundles (bundle-uri): move clone bytes to static files — **the north star** (`docs/BUNDLE_URI_DESIGN.md`)
-- Strategies (config, D21/D22): **weekly full** (for a big repo = base pack ∘ header via store-side compose — GCS
-  natively, S3 by multipart `UploadPartCopy`; no disk, no index-pack), **daily incremental** chained on the previous
-  daily, **hourly incremental** on the newest daily, each on a calendar slot (6-field UTC cron `schedule`; the fire
-  time is the as-of instant), `creationToken = slot epoch`, main-only refs for `bundles.main_only` repos;
-  `bundles/list.pb` CAS'd.
-- Served as static objects (`/{o}/{r}.git/bundles/...`, ETag/Range, immutable) by walgit or offloaded to an edge
-  (`X-Accel-Redirect`, `deploy/nginx.conf.example`), or as presigned store URLs (`serve_via = "signed_url"`);
-  advertised in the v2 capability list, at `bundles/list` and on band 2 of every narrated fetch. `bundles.require`
-  refuses *unbounded* zero-have fetches of listed repos with the exact fix (D17).
-- Builds run on the **maintainer** under `leases/bundle:<strategy>` (Serve sync first; unresolvable tips skipped
-  with a notice); weekly full is a compose.
-- **Blobless family** (design §6b): strategies with `filter = "blob:none"` — weekly-history = header ∘ the D18
-  history pack, incrementals `--filter=blob:none` — advertised ONLY at `bundles/list?filter=blob:none`.
+### 2.6 Packfile delivery target (D42)
+
+[The packfile design](docs/PACKFILE_URI_DESIGN.md) replaces scheduled bundle wrappers with reusable ordinary
+packs selected during fetch. Exact current-policy group certificates and captured snapshots must prove every
+subtracted root, with complete same-generation dependencies and live checks on every CAS attempt. Metadata
+stays outside normal code delivery; retained indexed objects survive maintenance. Static URLs require read
+authorization plus exact live/retired membership. Retired downloads do not expire arbitrarily.
+
+The native v2 path delivers proven URI packs for anonymous-read clients; gix/remote engines stay dynamic.
+Protected clients retain dynamic fallback pending independent authenticated-client qualification. Discovery
+uses `refs.advertise`; v2 mirrors request `server-option=ref-view=all` for complete ordinary refs. Static pack
+and index GET/HEAD require read auth and fresh live/retired membership. Never subtract synthetic haves on a
+path that does not emit their URLs. See [migration gates](docs/PACKFILE_MIGRATION.md) before changing durable writers.
 
 ### 2.7 Tasks, progress, narration (`walgit-wal/src/tasks.rs`, `crates/walgit-server/src/sse.rs`, `smart.rs`)
 Any long work = a task: unique id, per-instance log (`GET …/tasks`), `(repo, kind)` lock (a second start joins),
@@ -258,7 +248,7 @@ decision in §4 — or the PR is; never "fix later".
 | # | Principle | The tell in a PR | The question to answer |
 |---|---|---|---|
 | **I** | **No state outside the object store.** Disk and memory are caches. | A database, Redis, SQLite, a file that must survive a restart, an env var that encodes data. | "If every instance is wiped now, what is lost?" — must be "warmth". |
-| **II** | **The manifest CAS is the only commit point.** Immutable objects are never overwritten (`PutMode::Overwrite` only on the manifest, bundle list, leases, fsck.pb, events/cursor, maintainer heartbeats, render cache). | A second "commit" (a flag file, a list update that makes data visible), an ACK before the bucket's. | "What does a client on another instance see between the PUT and the CAS?" — nothing new. |
+| **II** | **The manifest CAS is the only commit point.** Immutable objects are never overwritten (`PutMode::Overwrite` only on the manifest, leases, fsck.pb, events/cursor, maintainer heartbeats, render cache). | A second "commit" (a flag file, a list update that makes data visible), an ACK before the bucket's. | "What does a client on another instance see between the PUT and the CAS?" — nothing new. |
 | **III** | **Side effects are readers of the WAL, never steps of a write.** Events, mirrors, notifications tail the log from a durable cursor. | A webhook/HTTP call from `receive.rs`, `publish.rs`, `follow.rs`, `smart.rs`. | "If this side effect fails, does the push?" — no. "Is it replayable from the cursor?" — yes. |
 | **IV** | **Every read revalidates; there is no eventually.** | A cache that outlives the manifest's generation, a TTL invented for a repo-scoped answer, a read that skips `sync_*`. | "After `push` returns `ok`, can any instance serve the old state?" (`cargo test -p walgit-server --test sim`). |
 | **V** | **Serve from the parts that fit; never a bigger box, never a hard-coded host.** | "Just download the pack", a path that assumes the full pack set is local, a hostname in `crates/` or `web/`. | "What happens to this code on a 20 GiB tmpfs with a 32 GB base pack? Which sync level does it need?" |
@@ -270,7 +260,11 @@ decision in §4 — or the PR is; never "fix later".
 
 ---
 
-## 4. Decisions in force (append, never silently change)
+## 4. Decisions (append, never silently change)
+
+D42 supersedes every bundle-specific runtime statement below, including D2/D9/D11/D17/D19/D21/D22/D24/D26/D29/D41.
+Those statements are retained as decision history, not active configuration or implementation guidance.
+Unrelated constraints remain in force. The current design target and migration gates are linked in §0.
 - **D1** Rust, tokio + axum, HTTP/2 (h2c or ALPN), streaming both ways, gzip request bodies.
 - **D2** gix in-process where it is correct and measured; upstream `git` for delta-compressing repack/bitmaps,
   bundle creation, and normal upload-pack. **`git.upload_pack_engine = "auto"` selects stock git wherever it can
@@ -303,7 +297,7 @@ decision in §4 — or the PR is; never "fix later".
   `/{o}/{r}/api-browser/…`; `/api/v1` is non-repository discovery, identity and owner listing. No aliases.
 - **D16** Push authorization is a per-repo **rule language** at `repos/<o>/<r>/policy.json` (`docs/POLICY.md`).
   Envelope `version` + `groups` + `rules`; `protect` = AND. Empty/missing = anyone with write may move any ref.
-- **D17** `bundles.require` refuses only **unbounded** zero-have fetches (no `deepen*`, no `filter`): that is a
+- **D17 (historical; superseded by D42)** `bundles.require` refuses only **unbounded** zero-have fetches (no `deepen*`, no `filter`): that is a
   full clone and belongs to bundle-uri. Bounded zero-have fetches (CI's `--depth`/`--filter`) go to upload-pack.
   git never retries a failed bundle download and then falls back to a zero-have fetch; a principal that fetched
   the repo's `bundles/list` within the hour gets **one upload-pack full clone per 6 h** with a loud band-2
@@ -323,15 +317,15 @@ decision in §4 — or the PR is; never "fix later".
   (`web/sdk/repos.ts`; IIFE registers `window.repos`, ESM `repos.mjs`) maps the whole surface, picks the lane,
   does the popup dance and unwraps the SSE envelope; served at `/repos.js` (open, so a `<script>` tag can load it).
   **Dogfood rule**: the bundled UI is built on the SDK (`web/src/api.ts` is an adapter); fix the SDK, never fork.
-- **D21** **No monthly bundle layer.** git's `creationToken` heuristic never walks past a full bundle; two layers
+- **D21 (historical; superseded by D42)** **No monthly bundle layer.** git's `creationToken` heuristic never walks past a full bundle; two layers
   of incrementals (daily, hourly) under one full (weekly) is the shape. Incrementals without `chain` list only
   their 2 newest per strategy (the second so a client that read the list a slot ago never 404s mid-chain);
   **`chain = true`** cuts a slot on the strategy's own previous bundle while that is newer than the newest base
   bundle — every slot since the base is wanted and kept, each exactly its delta. **Dailies are chained by
   default**; hourlies stay on the newest daily with 2 kept. `slots::base_for_incremental` is the one place that
   knows either rule.
-- **D22** **Bundles are cut on calendar slots, main-only, as-of-slot, with a contiguous chain**
-  (`docs/BUNDLE_URI_DESIGN.md` §3/§4): a 6-field UTC cron `schedule` whose fire time *is* the slot; missing full
+- **D22 (historical; superseded by D42)** **Bundles are cut on calendar slots, main-only, as-of-slot, with a contiguous chain**
+  (the former bundle design): a 6-field UTC cron `schedule` whose fire time *is* the slot; missing full
   slots backfilled oldest-first (`backfill_max`); content is main as of the highest WAL seq with `created_at ≤
   slot`; `creationToken = slot epoch`; prerequisites = tips of the newest `base` bundle at or before the slot;
   retention = `keep` fulls + the chain under them; refs default to `HEAD` + `refs/heads/main` for
@@ -396,7 +390,7 @@ decision in §4 — or the PR is; never "fix later".
   `X-Walgit-Capabilities`** — never assumed. (3) `cache.dir` defaults to `/tmp/walgit`. (4) A missing `--config`
   file is fatal (exit 2); `--config /dev/null` is the explicit defaults+env form. (5) The credential helper and
   token file are host-derived (`<host>-credential-helper`, `<host>-token`) so two walgit hosts coexist on one machine.
-- **D41** **Bundles: chained dailies, a clone list and a catch-up list, the chain through the weekly.** Dailies
+- **D41 (historical; superseded by D42)** **Bundles: chained dailies, a clone list and a catch-up list, the chain through the weekly.** Dailies
   are cut on their predecessor (`chain = true`, default), hourlies on the newest daily (2 kept); at the tie between
   Sunday's daily and the weekly the chain continues through its own link, so Monday's daily has the weekly's tips
   as prerequisites without being cut on it; retention keeps the chain under every kept full. `bundles/list` (fulls
@@ -404,9 +398,98 @@ decision in §4 — or the PR is; never "fix later".
   catch-up is exactly the slots missed; for a client fetching several times a day, upload-pack's thin pack is
   smaller than an hourly bundle — bundles pay off for fresh clones and far-behind clients.
 
+- **D42 (2026-09-11): Replace bundle runtime with negotiated reusable packs, in reviewed stages.**
+  Migration: remove bundle crate/command/routes/protocol/schedules/config/cache/recipes now;
+  ordinary dynamic clone/fetch remain. [PACKFILE_URI_DESIGN.md](docs/PACKFILE_URI_DESIGN.md) is the replacement
+  target, not a claim that its later layers are wired. Independent code/meta groups, conserving history/blob
+  lifecycle, exact captured coverage/dependencies, CAS revalidation and authenticated live/retired membership
+  gate static emission. Retired URI records/bytes have no time or count cap. All engines must either deliver
+  selected URLs or avoid synthetic subtraction. Protected stock clients retain dynamic fallback until a
+  distributable authenticated client is independently verified. Durable protobuf numbers/messages remain
+  append-only/replayable; old bundle runtime objects are not read/written. Host config and new settings reject
+  obsolete bundle keys. A durable-only settings transition may explicitly remove the obsolete bundle table,
+  warn and preserve supported overrides/raw history; it must never invent a wider ref/packing policy.
+  [PACKFILE_MIGRATION.md](docs/PACKFILE_MIGRATION.md) defines compatible-writer rollout and evidence gates;
+  no bucket deletion is part of this change. D42 overrides bundle-specific parts of earlier decisions only.
+
+- **D43 (2026-09-11): Coverage and retirement authority lives in the manifest.** Named packing groups and
+  advertisement selectors are independent policies; group kinds grant no access. Canonical content-addressed
+  ref snapshots bind certificates to an exact captured generation. Every classification/compaction CAS checks
+  current policy, live members and same-generation dependencies; stale certificates lose eligibility without
+  deleting their objects. Retired checksums remain recorded indefinitely. Checkpoint metadata uses unique
+  attempt keys and commits the exact refs key; old checkpoints resolve their original committed descriptor.
+  Producers capture manifest, CAS token, refs and validated settings coherently. Invalid saved packing policy
+  fails coverage capture instead of substituting host defaults. Stop incompatible writers before the new
+  writer runs: older binaries do not enforce format-version fencing. This foundation alone does not emit URLs
+  or prove object conservation; those require the lifecycle and transport layers described in D42.
+
+- **D44 (2026-09-11): One pack lifecycle configuration replaces compaction knobs.** `[packs]` owns
+  geometric factor/count/proportional bytes/age, minimum two fold inputs, size/settlement freeze, frozen-share
+  and re-segmentation ratios, target segment size, and bounded delta-search resources. The default 2 GiB is
+  a Git target, not an absolute bound on an oversized object. Resolve an explicit CPU-bounded thread count
+  and divide the host-clamped whole-operation window-memory budget before invoking Git. Native Git is the
+  only producer, so there is no engine selector. GNU sort/comm are runtime dependencies. Classification and
+  proof repair stay separate from expensive re-segmentation; a missing certificate does not justify a cut.
+  Host/new settings reject `[compaction]`. Saved bucket records alone may map enabled/factor/count/lease
+  fields and omit the old Git-only engine; any saved flat trigger or retention timeout disables pack work
+  with an explicit warning until an administrator rewrites settings. Conflicting old/new sections fail;
+  other overrides and raw history survive. Ordinary serving remains available. This supersedes older
+  compaction-configuration and timed pack-retention guidance, while lifecycle and URI evidence gates in
+  D42/D43 remain required. [Migration details](docs/PACKFILE_MIGRATION.md).
+
+- **D45 (2026-09-12): Conserving maintenance uses one staged lifecycle.** The current §2.5
+  supersedes the single-base rebuild and separate geometric producer descriptions in D18/D31.
+  Existing derived history packs remain readable durable data. New grouped history is authoritative,
+  not a disposable accelerator. Preserve the full indexed input set through retained families,
+  commit outputs additively, and retire exact inputs only at the final manifest CAS. Verify local
+  MIDX/bitmap identity and traversal; remote engines retain ordinary traversal when pack bytes are
+  absent. Shared code/meta objects may occupy one physical checksum with both memberships; code
+  eligibility still requires exact code-group proof. Scratch receipts and locks cannot establish
+  durable authority. This layer does not certify negotiated delivery, protected clients, model
+  refinement, or large-repository resource/performance acceptance.
+
+- **D46 (2026-09-12): Native URI delivery and discovery have separate gates.** Normal discovery uses
+  `refs.advertise`; explicit v2 `ref-view=all` preserves mirror/backup access to ordinary auxiliary refs.
+  Receive-pack remains complete. Only native Git may subtract selected roots; gix and remote dispatch happen
+  first and remain dynamic. Selection uses exact captured certificates and one shared three-snapshot budget;
+  size/count limits cannot discard required companions. URI encoding is non-thin. Static pack/index routes
+  revalidate live/retired membership after ordinary read auth, and protected responses use private caching.
+  `packfile-indexes` is an explicit optional wire extension, not proof of authenticated-client compatibility.
+  Protected dynamic fallback remains until a distributable client is qualified. No version-label heuristic,
+  anonymous exposure of protected packs, `.rev` transfer, arbitrary-want coverage guess or full-clone refusal
+  knob is introduced. Large narrated dynamic clones warn. Scale and model/code mapping gates remain open.
+
 Decision identifiers are stable; gaps in the numbering are intentional.
 
+- **D47 (2026-09-12): Publication evidence and receipts are exact.** A no-op ref submission with no
+  new pack reports success at seq 0 without creating history; an empty-ref pack-only push rejects. A
+  rejected submission reports rejection for every command. Each immutable log claim carries a fresh
+  reserved `walgit.publication_nonce`; exact bytes, not key/sequence alone, resolve a lost CAS reply.
+  Missing evidence stays `CommitUnknown`. Buffered forwarding falls back only before delivery;
+  ambiguous transport and gateway replies never trigger local replay. Disable broker redirects and
+  automatic transport retries. Bounded models and their precise controls run in CI; the
+  [code/test map](docs/spec/README.md) records unproved boundaries and remaining corrections.
+
 ---
+
+- **D48 (2026-09-12): Cache evidence and readiness.**
+
+Remote index admission verifies index checksum, pack checksum identity and known descriptor size/count,
+including reused installed links. Repair installs a fresh inode. A repository-local kernel lock protects
+cache names across processes until callers own opened mappings or independent links; blocking workers keep
+the lock through cancellation. Temporary names belong to one attempt, and abandoned names are reclaimed
+only while holding the lock. This local ownership is disposable cache coordination, never publication
+truth. Carry pack readiness only from a proven matching inventory; inherited nonempty caches reconcile on
+open, including manifest changes that advance revision without adding a log entry. Small downloads reject
+short or oversized bodies. These checks do not replace the required per-CAS closure proof or establish the
+full cold-read/resource acceptance gates listed in `docs/spec/README.md`.
+
+- **D49 (2026-09-12): Final retirement re-proves indexed conservation.** Capture manifest/token/refs
+  together on every seal attempt, verify the exact current indexes, and merge input/output OID streams
+  with one cursor per pack. Every indexed input object must survive in the declared outputs, and every
+  current tip must appear in the resulting live inventory before the log claim/CAS. Raw producer admission
+  and candidate external-boundary proof remain separate obligations; local loose objects and retired
+  download membership cannot justify retirement. See the cost and remaining-evidence rows in the linked docs.
 
 ## 5. Working rules
 
@@ -421,7 +504,7 @@ Decision identifiers are stable; gaps in the numbering are intentional.
   stalled" with `inflight` and `tasks_running`: `inflight = 0` at a late tick ⇒ the platform paused the process,
   `inflight > 0` ⇒ a real stall — look at `lock_wait_max_ms` and `walgit_lock_wait_seconds{lock}`. Bulk bytes never
   share a transport with the control plane (`store.gcs.bulk_clients`, `bulk_concurrency`).
-- **Correct is not sufficient.** Every protocol change (publish, sync, leases, checkpoints, bundles) is also
+- **Correct is not sufficient.** Every protocol change (publish, sync, leases, checkpoints, pack delivery) is also
   judged on critical-path round trips against the bucket — read `docs/ROUNDTRIPS.md`, update its budget table, put
   before/after depth in the commit, keep verification on the failure path, assert request budgets in the sim.
 - **Standalone first (D39):** a feature must work with walgit hit directly (no edge, in-process TLS, bytes
@@ -429,8 +512,8 @@ Decision identifiers are stable; gaps in the numbering are intentional.
   infer an edge from config, never hardcode a hostname in `crates/` or `web/`.
 - **S3 and GCS are both first class.** Every store feature has both implementations and runs in the contract
   suite (`just test-s3` against rustfs, `just test-gcs <bucket>`); "GCS only" is a bug.
-- **Use the rig before prod** (`just dev-store` → `walgit-server --config walgit.standalone.toml`). Per-repo
-  settings (D24) with minute-scale slots compress a week of bundle behaviour into 30 minutes.
+- **Use the rig before prod** (`just dev-store` → `walgit-server --config walgit.standalone.toml`). Exercise
+  ordinary clone/fetch and bounded maintenance against the rig before testing on large repositories.
 - No new auth paths (§1.3). No LIST on hot paths. No unbounded buffering of packs in memory. No full
   materialization above `cache.max_bytes` in budget mode. No silent long operations (make it a task, narrate it).
 - Every immutable response: `immutable` + strong ETag + Range; every ref-dependent response: SWR + ETag.
@@ -439,7 +522,7 @@ Decision identifiers are stable; gaps in the numbering are intentional.
 - Web: pnpm + Vite, `pnpm run build` must pass oxlint/tsc. Config: `walgit.example.toml` documents every key;
   change it with the code.
 - Test tiers: `just test` (fast, < 1 min), `just e2e`, `just warnings`, `just clippy` (the
-  `[workspace.lints]` set, `-D warnings`), `just ci` = all four; the **simulation
+  `[workspace.lints]` set, `-D warnings`), `just ci` = all four plus `just sim` and `just smoke`; the **simulation
   suite** `cargo test -p walgit-server --test sim` (fault links per instance over one truth store: crash,
   partition, stale, lost response, orphan scenarios + randomized seeds `WALGIT_SIM_SEEDS`/`WALGIT_SIM_SEED`);
   `just test-slow` (ignored benches); `tests/e2e.sh` against a running server (`WALGIT_E2E_BASE_URL`,

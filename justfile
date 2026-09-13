@@ -93,8 +93,8 @@ dev-store-stop:
 # hung test blocks for the whole timeout. Use `just e2e` / `just ci` below.
 test:
     {{t5}} cargo test --workspace --lib --bins
-    {{t10}} cargo test -p walgit-store -p walgit-git -p walgit-wal -p walgit-bundle --tests
-    {{t10}} cargo test -p walgit-server --test web_api --test web_ui --test api_v1 --test static_http --test maintain --test routing_prefix --test lfs_upstream --test drain --test events --test follow --test policy --test snapshot
+    {{t10}} cargo test -p walgit-store -p walgit-git -p walgit-wal --tests
+    {{t10}} cargo test -p walgit-server --test web_api --test web_ui --test api_v1 --test static_http --test packfile_uri --test forward --test maintain --test routing_prefix --test lfs_upstream --test drain --test events --test follow --test policy --test snapshot
 
 # Smart-HTTP end-to-end against real git (≈ 20 s) — run when touching smart.rs/receive/upload-pack/wal.
 e2e *ARGS:
@@ -131,7 +131,16 @@ clippy:
     {{t15}} cargo clippy --workspace --all-targets -- -D warnings
 
 # Everything that must be green before a merge (what CI runs).
-ci: warnings clippy test e2e
+ci: warnings clippy test e2e sim smoke
+
+# Fault injection and recovery share process-wide test hooks; run serially.
+sim:
+    {{t15}} cargo test -p walgit-server --test sim -- --test-threads=1
+
+# Standalone CLI/server against memory; add WALGIT_TEST_S3_ENDPOINT for the local rig.
+smoke:
+    {{t15}} cargo build -p walgit-cli
+    WALGIT="$(realpath "${CARGO_TARGET_DIR:-target}/debug/walgit")" {{t15}} tests/e2e.sh
 
 # Slow tier: #[ignore]d benches/soaks (20k-ref push, 466k-ref render, ...).
 test-slow:
@@ -159,3 +168,13 @@ store-test-s3:
 # Run all walgit-store tests (memory + S3 if env set).
 store-test-all:
     cargo test -p walgit-store
+
+# Bounded contract checks and exact negative controls (Java 11+).
+spec:
+    scripts/run-spec.sh fast
+
+spec-fragments:
+    scripts/run-spec.sh fragments
+
+spec-full:
+    scripts/run-spec.sh full

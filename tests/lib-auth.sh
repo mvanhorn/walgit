@@ -30,9 +30,6 @@ walgit_auth_setup() {
     local host="${base#https://}"; host="${host#http://}"; host="${host%%/*}"
     export GIT_CONFIG_GLOBAL="${GIT_CONFIG_GLOBAL:-$(mktemp /tmp/walgit-gitconfig.XXXXXX)}"
     git config --global "http.https://$host/.extraHeader" "$WALGIT_AUTH_HEADER"
-    git config --global transfer.bundleURI true
-    # fetch.bundleURI is a per-clone URI (the recipes set it); never a global.
-    git config --global --unset-all fetch.bundleURI 2>/dev/null || true
     git config --global user.email "walgit-tests@example.com"
     git config --global user.name "walgit tests"
     echo "auth: bearer header installed in private git config $GIT_CONFIG_GLOBAL for $host" >&2

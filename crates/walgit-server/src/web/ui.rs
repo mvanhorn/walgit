@@ -8,11 +8,9 @@ use axum::extract::{Path as AxumPath, State};
 use axum::http::{HeaderMap, HeaderValue, Method, Request, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
-use prost::Message;
 use rust_embed::RustEmbed;
 use serde::Serialize;
-use walgit_proto::v1::{Checkpoint, EntryKind};
-use walgit_store::{GetOptions, GetResult, ObjectStore};
+use walgit_proto::v1::EntryKind;
 
 use crate::AppState;
 use crate::error::ApiError;
@@ -166,7 +164,7 @@ pub struct InstallQuery {
     tree: Option<String>,
 }
 
-/// `/services/public/install.sh[?repo=owner/name]`: the ONE idempotent client setup command — token, credential helper, bundle URIs, self-test, and with
+/// `/services/public/install.sh[?repo=owner/name]`: the ONE idempotent client setup command — token, credential helper, self-test, and with
 /// `repo` the clone. Open at the app (no credential exists yet when it is fetched).
 pub async fn install_sh(
     State(state): State<Arc<AppState>>,
@@ -372,7 +370,7 @@ struct Overview {
     /// Which instance rendered this page (kind, name, shape, build).
     instance: crate::instance::InstanceInfo,
     clone_url: String,
-    /// One-time git setup for this host (credential helper + bundle-uri), multi-line.
+    /// One-time git setup for this host (credential helper), multi-line.
     setup: String,
     /// `curl -fsSL …/services/public/install.sh | sh` one-liner (the open lane; no token needed).
     install: String,
@@ -383,10 +381,7 @@ struct Overview {
     manifest: ManifestInfo,
     local: LocalInfo,
     packs: PacksInfo,
-    bundles: Vec<BundleInfo>,
-    /// Calendar slot table (built / missing / unavailable / wrong-host) and
-    /// who maintains this repository (heartbeats). See `walgit bundle plan`.
-    bundle_plan: BundlePlanInfo,
+    maintenance: MaintenanceInfo,
     compactions: Vec<CompactionInfo>,
     node: serde_json::Map<String, serde_json::Value>,
     ops: OpsInfo,
@@ -395,25 +390,9 @@ struct Overview {
 }
 
 #[derive(Serialize, Default)]
-struct BundlePlanInfo {
-    slots: Vec<SlotInfo>,
-    /// The next slot of each strategy and the unit it will run (Sunday's base rebuild, visibly).
-    upcoming: Vec<crate::maintain::Upcoming>,
+struct MaintenanceInfo {
     maintainers: Vec<MaintainerInfo>,
-    /// True when no live heartbeat covers this repository.
     orphaned: bool,
-}
-
-#[derive(Serialize)]
-struct SlotInfo {
-    strategy: String,
-    kind: String,
-    /// Slot epoch seconds (0 = chain-level row).
-    slot: u64,
-    /// `built` | `missing` | `blocked` | `unavailable` | `wrong-host`
-    status: String,
-    detail: String,
-    bundle_id: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -464,8 +443,6 @@ struct OpsInfo {
     /// Recent + running tasks on this instance (ops and automatic ones:
     /// materialize, remote-index).
     recent: Vec<walgit_wal::TaskRecord>,
-    /// Configured bundle strategies (for the bundle op's `strategy` param).
-    bundle_strategies: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -477,11 +454,7 @@ struct ManifestInfo {
     tail_entries: usize,
     entries: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
-    checkpoint: Option<BundleInfo>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     packset: Option<PacksetInfo>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    advertised_bundle_uri: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     last_push: Option<String>,
 }
@@ -501,30 +474,6 @@ struct PacksetInfo {
     bytes: u64,
     created: String,
     creator: String,
-}
-
-#[derive(Serialize)]
-struct BundleInfo {
-    sha: String,
-    size: u64,
-    at_seq: u64,
-    created: String,
-    creator: String,
-    uri: String,
-    /// Chain facts (empty for the checkpoint bundle): strategy, full|incremental, the bundle whose
-    /// tips are this one's prerequisites (empty for a full), creationToken, object filter, ref tips.
-    #[serde(default)]
-    strategy: String,
-    #[serde(default)]
-    kind: String,
-    #[serde(default)]
-    base_id: String,
-    #[serde(default)]
-    creation_token: u64,
-    #[serde(default)]
-    filter: String,
-    #[serde(default)]
-    tips: Vec<(String, String)>,
 }
 
 #[derive(Serialize)]
@@ -597,7 +546,6 @@ async fn overview(
     let recipes = crate::setup::recipes(&state.cfg, &base_url, Some(&id.to_string()));
     let setup = recipes.setup_text.clone();
 
-    let checkpoint = checkpoint_info(&handle, &manifest, &base_url).await?;
     let created = manifest
         .updated_at
         .as_ref()
@@ -676,7 +624,6 @@ async fn overview(
             block_cache_bytes: cached,
         }
     });
-    let bundles = bundle_infos(&state, &id, &base_url).await?;
 
     // Health + suggestions.
     let mut issues = Vec::new();
@@ -693,7 +640,7 @@ async fn overview(
         // D25: no budget on the SSD host — never the too-large path.
     } else if !handle.packs_fit() {
         issues.push(format!(
-            "pack set ({}) exceeds this instance's cache limit ({}); objects are read from the store by range, clones must use bundle-uri",
+            "pack set ({}) exceeds this instance's cache limit ({}); objects are read from the store by range",
             walgit_wal::remote::human_bytes(manifest.packs.iter().map(|p| p.pack_size + p.idx_size).sum()),
             walgit_wal::remote::human_bytes(state.cfg.cache.max_bytes.as_u64())
         ));
@@ -714,44 +661,16 @@ async fn overview(
             ),
         });
     }
-    let has_bitmap_base = manifest.packs.iter().any(|p| p.tier == 2 && p.has_bitmap);
     let fresh = manifest.packs.iter().filter(|p| p.tier == 0).count();
-    let ecfg = handle.effective_config();
-    let compaction_on = ecfg.compaction.enabled && state.cfg.has_role(walgit_config::Role::Compact);
-    let live_bytes: u64 = manifest
-        .packs
-        .iter()
-        .map(|p| p.pack_size + p.idx_size)
-        .sum();
-    let weekly = ecfg
-        .bundles
-        .strategy
-        .iter()
-        .find(|s| s.kind == walgit_config::BundleKind::Full)
-        .map(|s| s.name.clone());
-    if !manifest.packs.is_empty() && !has_bitmap_base {
-        suggestions.push(Suggestion {
-            op: "compact",
-            params: Some("base=1".into()),
-            reason: "no bitmap'd base pack: clones compute reachability on every instance".into(),
-            auto: match (&weekly, compaction_on) {
-                (Some(w), true) => Some(format!(
-                    "at the next `{w}` slot, on a maintainer whose capacity holds the pack set ({})",
-                    walgit_wal::remote::human_bytes(live_bytes)
-                )),
-                (Some(_), false) | (None, _) => None,
-                },
-        });
-    } else if fresh >= ecfg.compaction.trigger_packs.max(2) {
+    let ecfg = handle.validated_effective_config().map_err(wal_err)?;
+    let maintenance_on = ecfg.packs.enabled && state.cfg.has_role(walgit_config::Role::Compact);
+    if fresh >= ecfg.packs.fold_needs_at_least_packs {
         suggestions.push(Suggestion {
             op: "compact",
             params: None,
-            reason: format!("{fresh} fresh push packs waiting to be folded"),
-            auto: compaction_on.then(|| {
-                format!(
-                    "geometric fold on the maintainer's next pass (trigger: {} packs / {})",
-                    ecfg.compaction.trigger_packs, ecfg.compaction.trigger_bytes
-                )
+            reason: format!("{fresh} fresh packs available for maintenance"),
+            auto: maintenance_on.then(|| {
+                "the maintainer evaluates size and age within each compatible pack family".into()
             }),
         });
     }
@@ -773,14 +692,6 @@ async fn overview(
                     humantime::format_duration(state.cfg.wal.checkpoint_interval),
                     state.cfg.wal.checkpoint_tail_bytes
                 )),
-            });
-        }
-        if ecfg.bundles.enabled && bundles.is_empty() {
-            suggestions.push(Suggestion {
-                op: "bundle",
-                params: None,
-                reason: "no bundle-uri bundle published: initial clones go through upload-pack".into(),
-                auto: weekly.as_ref().map(|w| format!("the first `{w}` slot at or after the repository's first WAL state, on the maintainer's next pass")),
             });
         }
     }
@@ -859,80 +770,15 @@ async fn overview(
     let ops = OpsInfo {
         available: crate::ops::OPS.to_vec(),
         recent: state.registry.tasks().recent(&id.to_string()),
-        bundle_strategies: state
-            .cfg
-            .bundles
-            .strategy
-            .iter()
-            .map(|s| s.name.clone())
-            .collect(),
     };
     let clone = CloneInfo {
         manual: recipes.manual_clone.clone(),
         plain: recipes.plain_clone.clone(),
     };
-    // Slot table + maintainers (best effort; never fails the overview).
-    let bundle_plan = {
-        let ctx = walgit_bundle::slots::PlanContext {
-            first_state: handle.first_state_time(),
-            can_full: true,
-            can_incremental: true,
-            wrong_host_reason: None,
-        };
-        let slots = match state
-            .bundles
-            .plan(&id, std::time::SystemTime::now(), ctx)
-            .await
-        {
-            Ok(rows) => rows
-                .into_iter()
-                .map(|r| {
-                    use walgit_bundle::slots::SlotStatus as S;
-                    let (status, detail, bundle_id) = match r.status {
-                        S::Built { id, size, seq } => {
-                            ("built", format!("{size} bytes, seq {seq}"), Some(id))
-                        }
-                        S::Missing => ("missing", String::new(), None),
-                        S::Pending => (
-                            "pending",
-                            "slot just fired; built or settled after the 2-minute close grace"
-                                .into(),
-                            None,
-                        ),
-                        S::Blocked(w) => ("blocked", w, None),
-                        S::Unavailable => ("unavailable", "no WAL state at that time".into(), None),
-                        S::TooSmall { commits, min } => (
-                            "too-small",
-                            format!(
-                                "{commits} commits since base (min {min}); next slot catches up"
-                            ),
-                            None,
-                        ),
-                        S::Skipped { reason } => ("skipped", reason, None),
-                        S::WrongHost(w) => ("wrong-host", w, None),
-                    };
-                    SlotInfo {
-                        strategy: r.strategy,
-                        kind: format!("{:?}", r.kind).to_lowercase(),
-                        slot: r.slot,
-                        status: status.into(),
-                        detail,
-                        bundle_id,
-                    }
-                })
-                .collect(),
-            Err(_) => Vec::new(),
-        };
+    let maintenance = {
         let hbs_all = crate::maintain::heartbeats(&state)
             .await
             .unwrap_or_default();
-        let upcoming = crate::maintain::upcoming(
-            &handle,
-            &handle.effective_config(),
-            &hbs_all,
-            std::time::SystemTime::now(),
-        )
-        .await;
         let maintainers: Vec<MaintainerInfo> = match Ok::<_, anyhow::Error>(hbs_all) {
             Ok(hbs) => hbs
                 .into_iter()
@@ -961,9 +807,7 @@ async fn overview(
             Err(_) => Vec::new(),
         };
         let orphaned = !maintainers.iter().any(|m| m.alive);
-        BundlePlanInfo {
-            slots,
-            upcoming,
+        MaintenanceInfo {
             maintainers,
             orphaned,
         }
@@ -998,9 +842,7 @@ async fn overview(
                 .collect(),
             tail_entries: entries.len(),
             entries: entries.len(),
-            checkpoint,
             packset,
-            advertised_bundle_uri: None,
             last_push,
         },
         local: LocalInfo {
@@ -1017,8 +859,7 @@ async fn overview(
             live_bytes: packs_bytes,
             pushes: push_count,
         },
-        bundles,
-        bundle_plan,
+        maintenance,
         compactions,
         node: {
             let mut m = serde_json::Map::new();
@@ -1052,13 +893,6 @@ async fn ops_list(
     let body = OpsInfo {
         available: crate::ops::OPS.to_vec(),
         recent: state.registry.tasks().recent(&id.to_string()),
-        bundle_strategies: state
-            .cfg
-            .bundles
-            .strategy
-            .iter()
-            .map(|s| s.name.clone())
-            .collect(),
     };
     Ok((
         [
@@ -1098,7 +932,7 @@ async fn ops_start(
 }
 
 /// `GET …/tasks` — running + recent background tasks of this repo on this
-/// instance (materialize, remote-index, fsck, compact, bundle, ...). The UI
+/// instance (materialize, remote-index, fsck, compact, ...). The UI
 /// polls this to show what is happening to a repo.
 async fn tasks_list(
     State(state): State<Arc<AppState>>,
@@ -1189,113 +1023,6 @@ async fn snapshot(
         serde_json::to_vec(&body).map_err(|e| ApiError::Internal(e.to_string()))?,
     )
         .into_response())
-}
-
-async fn checkpoint_info(
-    handle: &walgit_wal::RepoHandle,
-    manifest: &walgit_proto::v1::Manifest,
-    _base_url: &str,
-) -> Result<Option<BundleInfo>, ApiError> {
-    let Some(reference) = &manifest.checkpoint else {
-        return Ok(None);
-    };
-    let (size, created, creator) = match handle
-        .store()
-        .get(&reference.key, GetOptions::default())
-        .await
-    {
-        Ok(GetResult::Object { meta, body }) => {
-            let bytes = walgit_store::util::collect(body, meta.size as usize)
-                .await
-                .map_err(|e| ApiError::Internal(e.to_string()))?;
-            let checkpoint = Checkpoint::decode(bytes.as_ref())
-                .map_err(|e| ApiError::Internal(e.to_string()))?;
-            (
-                meta.size,
-                checkpoint
-                    .created_at
-                    .as_ref()
-                    .map(timestamp)
-                    .unwrap_or_default(),
-                checkpoint.writer,
-            )
-        }
-        Ok(GetResult::NotModified { .. }) | Err(walgit_store::StoreError::NotFound { .. }) => {
-            (0, String::new(), String::new())
-        }
-        Err(error) => return Err(ApiError::Internal(error.to_string())),
-    };
-    Ok(Some(BundleInfo {
-        sha: reference.key.clone(),
-        size,
-        at_seq: reference.seq,
-        created,
-        creator,
-        // Checkpoints are store objects (not served over HTTP); show the key.
-        uri: format!("gs://…/{}", reference.key),
-        strategy: String::new(),
-        kind: String::new(),
-        base_id: String::new(),
-        creation_token: 0,
-        filter: String::new(),
-        tips: Vec::new(),
-    }))
-}
-
-async fn bundle_infos(
-    state: &AppState,
-    id: &walgit_git::RepoId,
-    base_url: &str,
-) -> Result<Vec<BundleInfo>, ApiError> {
-    let list = state
-        .bundles
-        .list(id)
-        .await
-        .map_err(|e| ApiError::Internal(e.to_string()))?;
-    let Some(list) = list else {
-        return Ok(Vec::new());
-    };
-    // Exactly the URIs the bundle-uri advertisement hands to git (one code
-    // path: walgit_bundle::render::bundle_uri), so the WAL page never shows a
-    // link that differs from what clients download.
-    let handle = state.registry.open(id).await.map_err(wal_err)?;
-    let mut out = Vec::with_capacity(list.bundles.len());
-    for bundle in list.bundles {
-        let uri = walgit_bundle::render::bundle_uri(
-            &bundle,
-            id.owner(),
-            id.name(),
-            base_url,
-            state.cfg.bundles.serve_via,
-            handle.store(),
-            state.cfg.bundles.signed_url_ttl,
-        )
-        .await
-        .map_err(|e| ApiError::Internal(e.to_string()))?;
-        out.push(BundleInfo {
-            sha: bundle.id.clone(),
-            size: bundle.size,
-            at_seq: bundle.seq,
-            created: bundle
-                .created_at
-                .as_ref()
-                .map(timestamp)
-                .unwrap_or_default(),
-            creator: String::new(),
-            uri,
-            strategy: bundle.strategy.clone(),
-            kind: bundle.kind.clone(),
-            base_id: bundle.base_id.clone(),
-            creation_token: bundle.creation_token,
-            filter: bundle.filter.clone(),
-            tips: bundle
-                .tips
-                .iter()
-                .map(|t| (t.name.clone(), t.oid.clone()))
-                .collect(),
-        });
-    }
-    Ok(out)
 }
 
 fn timestamp(value: &prost_types::Timestamp) -> String {

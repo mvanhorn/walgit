@@ -21,8 +21,8 @@ pub async fn run(
     base: bool,
     cfg: &Arc<Config>,
 ) -> Result<()> {
-    if !cfg.compaction.enabled {
-        bail!("compaction is disabled in config");
+    if !cfg.packs.enabled {
+        bail!("pack maintenance is disabled in config");
     }
 
     let store = open_store(cfg).await?;
@@ -43,7 +43,7 @@ pub async fn run(
     }
     loop {
         for id in &target_repos {
-            match compact_one(&registry, id, cfg, base).await {
+            match compact_one(&registry, id, base).await {
                 Ok(summary) => println!("{id}: {summary}"),
                 Err(e) => warn!(repo = %id, error = %e, "compaction failed"),
             }
@@ -56,12 +56,7 @@ pub async fn run(
     Ok(())
 }
 
-async fn compact_one(
-    registry: &Registry,
-    id: &walgit_git::RepoId,
-    cfg: &Config,
-    base: bool,
-) -> Result<String> {
+async fn compact_one(registry: &Registry, id: &walgit_git::RepoId, base: bool) -> Result<String> {
     let handle = registry.open(id).await?;
     let log = |line: String| {
         info!(repo = %id, "{line}");
@@ -69,7 +64,6 @@ async fn compact_one(
     };
     let outcome = compact_repo(
         &handle,
-        cfg,
         CompactRequest {
             force: base,
             rebuild_base: base,
@@ -79,8 +73,7 @@ async fn compact_one(
     .await?;
     let mut summary = outcome.summary();
     if base {
-        // The weekly bundle is composed from this base with the refs at its
-        // seq: write the checkpoint now so `walgit bundle compose` finds them.
+        // Checkpoint the rebuilt pack set so cold readers can install it directly.
         let cp = handle.write_checkpoint().await?;
         {
             let _ = std::fmt::Write::write_fmt(

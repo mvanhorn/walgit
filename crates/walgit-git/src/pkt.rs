@@ -270,6 +270,9 @@ pub async fn read_command<R: AsyncRead + Unpin>(mut r: R) -> Result<(V2Command, 
                     cmd.name = rest.to_string();
                     saw_name = true;
                 } else if let Some((k, v)) = s.split_once('=') {
+                    if k == "server-option" {
+                        cmd.args.push(s.clone());
+                    }
                     cmd.caps.insert(k.to_string(), v.to_string());
                 } else {
                     // Could be a capability ("thin-pack") or a positional arg.
@@ -367,9 +370,6 @@ pub fn parse_object_info(cmd: &V2Command) -> ObjectInfoRequest {
     }
     req
 }
-
-/// `bundle-uri` has no arguments in v2.
-pub fn parse_bundle_uri(_cmd: &V2Command) {}
 
 fn io_to_git(e: std::io::Error) -> GitError {
     GitError::Io(e)

@@ -9,6 +9,9 @@ pub mod v1 {
     include!(concat!(env!("OUT_DIR"), "/walgit.v1.rs"));
 }
 
+pub mod inventory;
+pub mod snapshot;
+
 pub use prost;
 pub use prost::Message;
 pub use prost_types;
@@ -69,6 +72,10 @@ pub mod keys {
     }
     pub fn checkpoint_key(seq: u64) -> String {
         format!("{CHECKPOINTS_DIR}{seq:016x}/checkpoint.pb")
+    }
+    /// Unique candidate metadata; attempt must be a caller-generated safe identifier.
+    pub fn checkpoint_attempt_key(seq: u64, attempt: &str) -> String {
+        format!("{CHECKPOINTS_DIR}{seq:016x}/attempts/{attempt}/checkpoint.pb")
     }
     pub fn checkpoint_refs_key(seq: u64) -> String {
         format!("{CHECKPOINTS_DIR}{seq:016x}/refs.pb")

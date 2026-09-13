@@ -101,6 +101,8 @@ impl Registry {
             return Err(WalError::NotFound);
         };
 
+        crate::validate_manifest(&manifest)?;
+
         // Open or init local repo (LocalRepo joins owner/name.git onto the root).
         let local = if let Some(l) = LocalRepo::open(&self.cache_root, id)? {
             l
@@ -110,9 +112,13 @@ impl Registry {
         };
 
         // Load state
-        let state = load_state(local.path());
+        let mut state = load_state(local.path());
+        // A persisted readiness counter is not evidence that inherited files
+        // are intact. Reconcile nonempty inventories once after process open.
+        state.packs_revision = 0;
 
-        let state_is_behind = state.applied_seq < manifest.head_seq;
+        let state_is_behind =
+            state.applied_seq < manifest.head_seq || state.revision != manifest.revision;
         let manifest_version = meta.version.clone();
 
         let handle = RepoHandle::new(
@@ -138,6 +144,10 @@ impl Registry {
             crate::sync::apply_delta(&handle, &manifest, &manifest_version).await?;
         }
 
+        if manifest.packs.is_empty() {
+            let mut state = handle.state.lock();
+            state.packs_revision = state.revision;
+        }
         self.repos.insert(id.clone(), handle.clone());
         Ok(handle)
     }
@@ -215,6 +225,7 @@ impl Registry {
             writer: crate::handle::instance_id(),
             revision: 1,
             settings: None,
+            retired_packs: Vec::new(),
         };
 
         let buf = manifest.encode_to_vec();
@@ -230,7 +241,12 @@ impl Registry {
                 // Init local repo
                 let local = LocalRepo::init(&self.cache_root, id, format)?;
 
-                let state = RepoState::default();
+                let state = RepoState {
+                    manifest_version: Some(meta.version.as_str().to_string()),
+                    revision: manifest.revision,
+                    packs_revision: manifest.revision,
+                    ..Default::default()
+                };
                 save_state(local.path(), &state)?;
 
                 let handle = RepoHandle::new(
@@ -478,6 +494,9 @@ fn dir_size(path: &std::path::Path) -> u64 {
 }
 
 /// (used, total) bytes of the filesystem holding `path` (statvfs).
+// statvfs's block fields are u32 on macOS and u64 on Linux, so `as u64` is the one spelling
+// that is lossless on both; `From` would be a useless conversion on Linux.
+#[allow(clippy::cast_lossless)]
 fn disk_usage(path: &std::path::Path) -> Option<(u64, u64)> {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;

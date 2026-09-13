@@ -190,6 +190,23 @@ pub struct FaultStore {
     /// Patterns from `panic_once_keys` already fired.
     fired_panics: Mutex<Vec<String>>,
     trace: Mutex<Option<Vec<String>>>,
+    gate: Mutex<Option<(String, String, Arc<OperationGate>)>>,
+}
+
+/// Deterministically pause one operation before it touches the truth store.
+#[derive(Default)]
+pub struct OperationGate {
+    entered: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+impl OperationGate {
+    pub async fn entered(&self) {
+        self.entered.notified().await;
+    }
+    pub fn release(&self) {
+        self.release.notify_one();
+    }
 }
 
 enum Decision {
@@ -213,6 +230,7 @@ impl FaultStore {
             stats: Stats::default(),
             fired_panics: Mutex::new(Vec::new()),
             trace: Mutex::new(None),
+            gate: Mutex::new(None),
         })
     }
     pub fn name(&self) -> &str {
@@ -223,6 +241,12 @@ impl FaultStore {
     }
     pub fn stats(&self) -> &Stats {
         &self.stats
+    }
+    /// Gate the next matching operation; the key argument is a substring.
+    pub fn gate_next(&self, op: &str, key: &str) -> Arc<OperationGate> {
+        let gate = Arc::new(OperationGate::default());
+        *self.gate.lock() = Some((op.into(), key.into(), gate.clone()));
+        gate
     }
     /// Replace the plan (takes effect for every op issued from now on).
     pub fn set(&self, plan: FaultPlan) {
@@ -278,6 +302,21 @@ impl FaultStore {
         conditional: bool,
         read_body: bool,
     ) -> Decision {
+        let gate = {
+            let mut pending = self.gate.lock();
+            if pending
+                .as_ref()
+                .is_some_and(|(operation, pattern, _)| operation == op && key.contains(pattern))
+            {
+                pending.take().map(|(_, _, gate)| gate)
+            } else {
+                None
+            }
+        };
+        if let Some(gate) = gate {
+            gate.entered.notify_one();
+            gate.release.notified().await;
+        }
         self.stats.ops.fetch_add(1, Ordering::Relaxed);
         let plan = self.plan.lock().clone();
         if let Some(p) = plan

@@ -424,7 +424,7 @@ async fn d26_prefix_form_matches_v1_alias() -> TestResult {
             "{}/t/pfx/api/settings?message=via+prefix",
             server.base_url
         ))
-        .body("[bundles]\nmin_commits = 7\n")
+        .body("[packs]\nfold_when_fresh_packs_reach = 7\n")
         .send()
         .await?;
     assert_eq!(r.status(), 200, "{}", r.text().await?);
@@ -442,7 +442,7 @@ async fn d26_prefix_form_matches_v1_alias() -> TestResult {
         .await?
         .json()
         .await?;
-    assert_eq!(d["bundles"]["min_commits"], 7);
+    assert_eq!(d["packs"]["fold_when_fresh_packs_reach"], 7);
     let p: serde_json::Value = c
         .get(format!("{}/t/pfx/api/policy", server.base_url))
         .send()
@@ -565,7 +565,7 @@ async fn repository_delete_requires_admin() -> TestResult {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn policy_and_settings_writes_require_admin() -> TestResult {
     const POLICY: &str = r#"{"version":1,"groups":[],"rules":[]}"#;
-    const SETTINGS: &str = "[bundles]\nmin_commits = 3\n";
+    const SETTINGS: &str = "[packs]\nfold_when_fresh_packs_reach = 3\n";
     let server = Server::start_with_tweak(|c| {
         c.server.auth.mode = walgit_config::AuthMode::Token;
         c.server.auth.anonymous_read = false;

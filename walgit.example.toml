@@ -1,7 +1,6 @@
 # walgit.toml — every configuration key, with its default and a comment.
 #
 # Start from walgit.standalone.toml for a first run; come here when you need a key.
-# Normative bundle-slot semantics: docs/BUNDLE_URI_DESIGN.md §4.
 # Every key can also be set from the environment: WALGIT__SECTION__KEY=value (TOML value syntax).
 # Validate with: walgit --config walgit.toml config check
 
@@ -15,16 +14,16 @@ drain_timeout = "20s"             # after SIGTERM, phase 2: how long in-flight r
                                   # and new fetch/push/LFS are refused (503 + Retry-After). The running maintenance unit
                                   # is interrupted at once in phase 1 while serving continues.
 max_push_bytes = "64GiB"          # largest accepted push
-# Roles this instance performs: "serve" (git, API, UI, bundles, LFS), "maintain" (checkpoints,
-# bundles, compaction, fsck/repair — implies compact + bundle), "events" (the webhook bridge).
+# Roles this instance performs: "serve" (git, API, UI, LFS), "maintain" (checkpoints,
+# compaction, fsck/repair — implies compact), "events" (the webhook bridge).
 # Empty = all of them: the one-box shape.
 roles = []
 auto_create_on_push = false       # create a repo on first push if missing
 accel_redirect = false            # behind an nginx edge that announces `X-Walgit-Capabilities: accel-redirect`
-                                  # (deploy/nginx.conf.example): answer bundle/LFS byte requests with X-Accel-Redirect
+                                  # (deploy/nginx.conf.example): answer LFS byte requests with X-Accel-Redirect
                                   # so the edge streams + caches the bytes from the bucket itself. Never on a host
                                   # clients reach directly (the answer carries a store credential).
-# public_url = "https://git.example.com"   # pins absolute URIs (bundle-uri, LFS, clone recipes, OAuth callback) behind a proxy
+# public_url = "https://git.example.com"   # pins absolute URIs (LFS, clone recipes, OAuth callback) behind a proxy
 # Browser origins allowed to call /{owner}/{repo}/api-browser/* cross-origin with credentials (the
 # repos.js browser lane from another site). Exact origins or one leading `*.`; empty = no
 # cross-origin lane (no CORS headers).
@@ -82,8 +81,8 @@ force_path_style = false          # true for most self-hosted S3 implementations
 [store.gcs]
 endpoint = "https://storage.googleapis.com"  # gRPC endpoint; credentials = Application Default Credentials
 direct_connectivity = true
-# signing_service_account = "sa@project.iam.gserviceaccount.com"   # for bundles/lfs serve_via = "signed_url"
-bulk_clients = 4                  # separate data channels for pack/idx/side-file/bundle/LFS bytes + ranged reads
+# signing_service_account = "sa@project.iam.gserviceaccount.com"   # for lfs serve_via = "signed_url"
+bulk_clients = 4                  # separate data channels for pack/idx/side-file/LFS bytes + ranged reads
 bulk_concurrency = 32             # max concurrent bulk requests per process (control plane never queues behind them)
 
 [cache]
@@ -99,7 +98,6 @@ prewarm_parallelism = 2
 prewarm_ready_timeout = "0s"      # >0: /readyz answers 503 until prewarm finished (or this long)
 ref_advert_entries = 256          # max rendered ref advertisement cache entries
 object_info_entries = 4096        # max object info (size/has) cache entries
-bundle_list_entries = 128         # max bundle list render cache entries
 remote_block_bytes = "1GiB"       # pack-data block LRU for repos too large to materialize (range reads)
 remote_object_bytes = "256MiB"    # decoded-object LRU for the remote reader
 shared_render_cache = true        # mirror rendered sha-addressed API JSON into the store (all instances share)
@@ -141,107 +139,29 @@ follow_interval = "30s"           # upstream-follow loop (its own loop next to t
 [placement]
 serve = ["*"]                     # object work here: git-upload-pack, git-receive-pack, LFS transfer, pack prefetch/prewarm …
 serve_exclude = []                # … except these: 503 + Retry-After before any sync; refs-level reads (info/refs,
-                                  # ls-refs, API via the remote reader, UI, bundle list) stay available everywhere
-maintain = ["*"]                  # maintainer units here (with roles ∋ maintain): checkpoints, bundles, compaction, fsck/repair …
+                                  # ls-refs, API via the remote reader, UI) stay available everywhere
+maintain = ["*"]                  # maintainer units here (with roles ∋ maintain): checkpoints, compaction, fsck/repair …
 maintain_exclude = []             # … except these
 
-[compaction]
+[packs]
 enabled = true
-factor = 2                        # geometric repack factor
-trigger_packs = 16                # compact when this many tier-0 packs exist
-trigger_bytes = "1GiB"            # or when tier-0 pack bytes exceed this (either way: at least 2 fresh packs; the base/history
-                                  # pack are never folded; a base is rebuilt only by the weekly unit / `walgit compact --base`)
-lease_ttl = "10m"                 # compaction lease TTL
-retention_superseded = "7d"       # keep old packs for provenance / rewind
-engine = "git"                    # "git" (gix cannot delta-compress)
-
-# ---------------------------------------------------------------------------
-# bundle-uri strategies (docs/BUNDLE_URI_DESIGN.md §3-§4 is the design of record)
-#
-#   * `schedule` is a 6-field cron expression in UTC ("sec min hour dom mon dow"; "@weekly" /
-#     "@daily" / "@hourly" are aliases for the defaults below). Each fire time is a SLOT: the
-#     bundle's content is main (or `refs`) AS OF that instant — resolved from the WAL (highest
-#     seq with created_at <= slot) — and `creationToken` = the slot's epoch seconds. Slots are
-#     deterministic: a bundle for Tuesday 23:00 built on Thursday contains Tuesday's main.
-#   * Missing slots are BACKFILLED oldest-first on every maintainer pass (up to `backfill_max`
-#     per pass, 0 = unlimited), so an outage leaves no holes in the chain.
-#   * `kind = "full"` has no prerequisites; git downloads every listed bundle newer than the newest
-#     full on a clone and never walks past it. `kind = "incremental"` requires `base`: its
-#     prerequisites are the tips of the newest `base` bundle whose slot <= this slot.
-#   * Retention: `keep` on a full strategy = fulls listed; an incremental strategy without `chain`
-#     lists its 2 newest whose base is kept (the second keeps a client that read the list a slot
-#     ago from a 404 — git never retries a bundle download).
-#   * `chain = true` on an incremental: a slot is cut on this strategy's own previous bundle while
-#     that is newer than the newest base bundle (dailies chain from the weekly; hourlies restart
-#     from each daily); every slot since the base is listed and kept, each exactly its delta:
-#     more downloads, no overlapping bytes, a catch-up is exactly the slots missed.
-#   * Refs: `bundles.main_only = true` -> HEAD + refs/heads/main (+ `bundles.extra_refs` globs);
-#     false -> refs/heads/*, refs/tags/*, HEAD. A strategy's own `refs = [...]` overrides.
-#   * Full bundles of repos whose pack set does not fit an instance are a bucket-side compose of
-#     the tier-2 base pack (GCS: native; S3: multipart UploadPartCopy); incrementals are built
-#     from the local small packs. Every build is a task (…/tasks) and is narrated.
-#   * Two lists per repository: bundles/list (fulls + chain, for clones) and bundles/catchup (the
-#     chain without fulls, what clone recipes record in fetch.bundleURI).
-# ---------------------------------------------------------------------------
-[[bundles.strategy]]
-name = "weekly"
-kind = "full"
-schedule = "0 0 23 * * Sun"       # Sunday 23:00 UTC (= "@weekly")
-keep = 2                          # fulls listed
-backfill_max = 1                  # at most one missed weekly per pass
-# refs = ["HEAD", "refs/heads/main", "refs/tags/v*"]   # override the default ref set for this strategy
-# min_commits = 25                # override bundles.min_commits for this strategy (incrementals only)
-
-[[bundles.strategy]]
-name = "daily"
-kind = "incremental"
-base = "weekly"
-schedule = "0 0 23 * * *"         # every day 23:00 UTC (= "@daily")
-backfill_max = 0
-chain = true                      # each daily on the previous one (the first on the weekly): <= 7 listed, a catch-up
-                                  # downloads exactly the days missed
-
-[[bundles.strategy]]
-name = "hourly"
-kind = "incremental"
-base = "daily"
-schedule = "0 0 * * * *"          # every hour :00 UTC (= "@hourly")
-backfill_max = 48
-# chain = false                   # hourlies stay on the newest daily, 2 newest listed: a fresh clone is
-                                  # 1 weekly + <= 7 dailies + 2 hourlies, an hourly catch-up <= 2 bundles
-
-# The blobless family for `git clone --filter=blob:none` (design §6b): a chain of its own, same slots,
-# advertised ONLY at bundles/list?filter=blob:none (clients pass --bundle-uri=<that URL>). The full
-# one composes the history pack (commits + trees, no blobs); incrementals pack --filter=blob:none.
-# [[bundles.strategy]]
-# name = "weekly-history"
-# kind = "full"
-# schedule = "0 0 23 * * Sun"
-# keep = 2
-# backfill_max = 1
-# filter = "blob:none"             # only "blob:none"; every strategy of a chain shares the filter
-# [[bundles.strategy]]
-# name = "daily-history"
-# kind = "incremental"
-# base = "weekly-history"
-# schedule = "0 0 23 * * *"
-# filter = "blob:none"
-
-[bundles]
-min_commits = 25                  # don't cut an incremental slot with fewer commits since its base (plan: too-small; fulls never gated)
-min_bytes = "0B"                  # optional second guard on the incremental's pack size (0 = off)
-main_only = true                  # default bundle refs: HEAD + refs/heads/main (false: heads/* + tags/* + HEAD)
-extra_refs = []                   # e.g. ["refs/tags/v*"] added to every bundle's default ref set
-serve_via = "proxy"               # "proxy" (bytes through walgit or the edge) | "signed_url" (presigned bucket URLs in the list)
-signed_url_ttl = "1h"
-advertise = true                  # advertise bundle-uri in v2 capabilities
-advertise_filtered = false        # filtered families in the PLAIN list/advertisement too (filter = lines) — only for
-                                  # clients whose git matches bundle.<id>.filter (docs/patches); stock git would
-                                  # swallow blobless bundles into a full clone (design §6b)
-require = []                      # repos ("owner/name" | "owner/*") whose unbounded zero-have clones must use
-                                  # bundle-uri; shallow/filtered zero-have requests and fetches with haves proceed
-signed_url_for = []               # repos whose bundle URIs are presigned store URLs (clone bytes bypass the hosts); on any
-                                  # signing error the listing falls back to proxy URIs and warns once per repo
+geometric_factor = 2              # fold compatible fresh pack families independently
+fold_when_fresh_packs_reach = 16
+fold_when_max_age = "1d"           # zero disables the age arm
+fold_needs_at_least_packs = 2      # never fold one pack into itself
+                                  # byte trigger: max(live bytes / geometric_factor², packfile_uri.uri_min_bytes)
+segment_max_bytes = "2GiB"         # Git target, not an absolute cap for an oversized single object
+segment_target_bytes = "0B"        # zero derives from segment_max_bytes; otherwise 1MiB..=max
+segment_delta_window = 250
+segment_delta_depth = 50
+segment_delta_window_memory = "2GiB" # whole-operation budget, divided over explicit resolved threads
+segment_reuse_objects = true       # reuse compressed undeltified objects; whole cuts recompute deltas
+segment_threads = 0                # resolve available CPUs before invoking Git; host memory also clamps
+freeze_when_settled = "14d"         # useful fold freezes after settlement; zero disables age arm
+frozen_coverage_target = 0.75       # 0 disables first-freeze coverage trigger
+resegment_when_frozen_folds_exceed = 0.5 # fold-derived frozen bytes / previous global-cut bytes
+lease_ttl = "10m"
+# Retired pack bytes and URL authority have no time-based retention knob.
 
 [lfs]
 enabled = true
@@ -259,7 +179,7 @@ max_object_bytes = "16GiB"
                                                           # maintenance.follow_interval, published through the WAL as a push; fast-forward only
 
 [git]
-binary = "git"                    # path to upstream git binary (>= 2.47 recommended: pack.writeReverseIndex, bundle-uri)
+binary = "git"                    # path to upstream git binary (>= 2.47 recommended: pack.writeReverseIndex)
 upload_pack_engine = "auto"       # "auto" = stock git when packs are local/mount-linked, gix only for remote-served bases | "git" | "gix"
 allow_filter = true               # uploadpack.allowFilter
 allow_any_sha1_in_want = false    # uploadpack.allowAnySHA1InWant
@@ -282,3 +202,20 @@ lock_wait_warn = "1s"             # WARN "lock wait" (lock, repo, wait_ms, reque
 # webhook_url = "https://hooks.example.com/walgit"   # each batch of ref events is POSTed as a JSON array
 # webhook_secret = ""             # X-Walgit-Signature: sha256=<HMAC-SHA256 of the body>; unset = unsigned
 # sweep_interval = "5m"           # backstop + health check (warns when a sweep finds unpublished entries); 0 = off
+
+# Packfile foundations: these policies are validated and stored, but URI delivery and
+# ref filtering are not enabled by the foundation-only change.
+[refs]
+advertise = ["refs/heads/*", "refs/tags/*"] # discovery policy, independent of packing identity
+[refs.packfiles.code]
+kind = "code"                     # excludes metadata by kind, not an access control
+include = ["refs/*"]              # exact/trailing-prefix selectors; HEAD uses captured symbolic target
+subtract = []                     # code-group dependencies; complete same-generation proof required
+[refs.packfiles.meta]
+kind = "meta"
+include = ["refs/meta", "refs/meta/*"]
+subtract = []
+
+[packfile_uri]
+uri_min_bytes = "32MiB"           # at least one useful pack; smaller required companions may accompany it
+max_uris_per_fetch = 64           # complete sets only; over-cap selections fall back dynamically
