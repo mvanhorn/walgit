@@ -2,7 +2,7 @@
 
 Context: **who needs to read this, and when.** Anyone (human or agent) touching a protocol that talks to the
 bucket: the publish path (`walgit-wal/src/publish.rs`), sync levels and freshness (`sync.rs`, `handle.rs`),
-checkpoints, compaction and its lease (`walgit-server/src/ops.rs`, `coord.rs`), bundles (`walgit-bundle`),
+checkpoints, compaction and its lease (`walgit-server/src/ops.rs`, `coord.rs`), pack delivery,
 the remote reader, LFS, or the `ObjectStore` backends themselves — and anyone writing or triaging simulation
 scenarios (`crates/walgit-server/tests/sim.rs`), because a sim fix that is correct but adds a happy-path request
 is a regression, not a fix. Read it *before* designing the change, use §5 when writing the commit/PR, and
@@ -13,7 +13,7 @@ write-rate cap — so the number and shape of round trips *is* the performance d
 
 **Correct is necessary, not sufficient.** walgit's only durable primitive is a bucket with ~60–80 ms per
 request, one serialized overwrite per second per object, and no transactions beyond single-object CAS.
-Every protocol we design on top (publish, sync, compaction, checkpoints, bundles, leases) is judged on two
+Every protocol we design on top (publish, sync, compaction, checkpoints, pack delivery, leases) is judged on two
 axes at once:
 
 1. **Safety/liveness** — the simulation suite (`crates/walgit-server/tests/sim.rs`) and the contract tests.
@@ -41,17 +41,25 @@ right shape. This document is the thinking tool; apply it to every protocol chan
 |---|---|---|---|
 | Any read (`info/refs`, ls-refs, web refs/resolve) | 1 cond GET (or 0 within `freshness_ttl`) | 1 | `sync.rs::freshness_check` |
 | Cold Refs sync | 1 manifest GET → 1 round (checkpoint refs ∥ log tail segments) | no checkpoint: 1 + tail (2 with one segment); checkpoint: 2 + tail | `registry.rs::open`, `sync.rs` |
+| Old checkpoint without inline refs descriptor | manifest GET → committed checkpoint metadata GET → its refs GET (tail can overlap) | one additional GET compared with a new descriptor; the old address must come from committed metadata, never a guessed sequence path | `snapshots.rs::checkpoint_snapshot` |
 | Push request / publish (`process_batch`) | 1 freshness GET → pack PUT ∥ idx PUT ∥ log PUT (1 round) → manifest CAS (1 round) | request: 5; already-synced publish: 4 | `publish.rs` |
 | Compaction publish | same shape as push | — | `publish.rs::publish_compact_impl` |
+| Conserving lifecycle | acquire lease → captured refs/full sync → each output publishes additively → final seal (lease heartbeat → refs revalidation → immutable log PUT → manifest CAS) | one additive publication per new physical checksum and one final CAS; heartbeat GET/CAS calls and full-sync downloads are additional maintenance costs; no change to ordinary push/read budgets | `pack_lifecycle.rs`, `classification.rs::seal_pack_replacement` |
+| Coverage repair | captured snapshot Create → bounded batches of classification CAS → final certificate CAS | snapshot equality GET only on Create conflict; up to 128 classifications per batch; every certificate rechecks current policy and live membership | `pack_lifecycle.rs::repair_metadata` |
+| Native URI selection | existing fetch sync → exact coverage snapshot GET | normally +1 GET, shared maximum 3 attempts across all groups; current manifest/ref view capture adds no GET; optional index trailers are local bounded reads | `packfile_uri.rs::select`, `snapshots.rs::fetch_view` |
+| Static pack/index GET | manifest revalidation → object HEAD → body/range GET | 3 warm requests; conditional 304/HEAD omits the body GET; cold registry open may add its normal snapshot/tail reads; no pack materialization or LIST | `packfile_uri.rs::get`, `static_object.rs` |
 | Checkpoint | 1 cond GET (freshness) → refs PUT ∥ checkpoint PUT → manifest CAS | 3 rounds, 4 requests (was 6/6 until 2026-08-22: a bundle-list GET before the checkpoint PUT and a log GET for provenance times sat in the chain; times now come from the writer's own applied state, `bundle_key` is no longer looked up) | `checkpoint.rs` |
+| Validated remote index admission | warm valid index: 0 store requests; absent/corrupt index: index GET (HEAD first only for old descriptors with unknown size), at most four indexes downloading concurrently | unchanged healthy store depth; corruption now triggers repair instead of admitting bad evidence. Checksums, lock, mmap and cleanup are local work; no LIST. Per-index checksum CPU cost occurs when constructing a new remote inventory, not per object lookup. | `index_cache.rs`, `remote.rs` |
+| Final replacement evidence | coherent refs-level manifest capture → verified current index mappings → conservation/current-tip scan → existing log claim/CAS | warm indexes add 0 store requests; cold/bad evidence adds index GETs (HEAD only for unknown sizes), four concurrent downloads. O(refs) local capture and streaming index-union scan per CAS attempt; no pack download or LIST. This cost is not zero-read or constant-time seal certification. | `classification.rs`, `closure.rs`, `index_cache.rs` |
+| Lost CAS response resolution | fresh manifest GET; only if the exact segment descriptor is listed, GET and compare the claimed log bytes | normally +1 GET on this failure path compared with key/sequence-only resolution; no added successful-push requests. Missing/folded evidence remains unknown. Per-attempt nonce and actual frame sizes are computed locally. | `publish.rs::cas_landed` |
 | Settings publish (D24) | refs sync (conditional GET) → log slot PUT → manifest CAS; readers pay nothing extra (settings ride inline on the manifest) | 3 rounds; read: 0 | `publish.rs::publish_settings_impl` |
 | Lease acquire | 1 GET → 1 CAS put (or 1 Create when absent) | 2 | `coord.rs::try_acquire` |
 | Publish, local commit (2026-08-23) | unchanged in round trips: after the manifest CAS the ref txns are applied to the local copy **before** the new manifest version is advertised, both under `sync_mutex` (the refs phase of every sync); the reverse order let a reader cache the old refs under the new version, and without the lock a concurrent sync replayed the same entry (two `update-ref`, a lock collision). A landed CAS is answered `ok` whatever the local apply does — the next sync replays (one conditional GET that then returns 200, no extra write). | 0 extra | `publish.rs::process_batch` |
-| Weekly compose: refs at the base's seq (`refs_at_seq`, 2026-08-23) | checkpoint `refs.pb` at that seq: 1 GET; else newest checkpoint ≤ seq (2 GETs) + the log entries through the seq (already cached by the refs sync in practice) — replayed in memory, never a local write | 1, or 2 + tail | `log_reader.rs::refs_at_seq`, `bundles.rs::compose_full_from_base` |
-| Maintainer bundle pass, refs level (retention + settle closed slots) | 1 list GET → at most 1 CAS (retention) → at most **1 CAS for every verdict of the pass** (`record_skipped_many`; was one CAS per settled slot until 2026-08-22: a rig repo with 9,654 closed slots paid 9,654 CAS per pass and, past the 4,096-verdict cap, forever) | ≤ 3 | `walgit-bundle/src/lib.rs::settle_closed_slots`, `ops.rs::record_skipped_many` |
 | Repository listing (`/api/v1/owners*`, `/services/api/owners*`, maintainer/bridge passes) | 0 within `LIST_TTL` (30 s, per instance); else delimited `repos/` → (delimited `repos/<o>/` ∥ owners) → (HEAD `manifest.pb` ∥ repos): 3 rounds | 1 + owners + repos | `registry.rs::list` |
 | LFS batch (either `serve_via`) | 1 HEAD per object (presence) ∥, then one bounded upstream batch for the misses (`upstream.lfs` only). Signing an href — GET or PUT — is local crypto: 0 requests. | objects (+1 upstream) | `lfs.rs::batch` |
 | LFS upload, `serve_via = "signed_url"` | the bytes go client → bucket, so walgit pays **no PUT of the object at all** (proxy: 1 PUT of up to `max_object_bytes` through this process); `verify` is 1 HEAD | −1 large PUT, +1 HEAD | `lfs.rs::signed_upload`, `verify` |
+| Bundle removal (2026-09-11) | v2 capabilities and narrated fetch: removed optional list GET (1 → 0 extra); maintenance no longer reads/CASes a bundle list; direct import no longer composes a wrapper or reads/CASes a bundle list | no new store requests; checkpoint and push budgets unchanged | `smart.rs`, `maintain.rs`, `import_direct.rs` |
+| Canonical checkpoint publication | unchanged: freshness → content-addressed refs PUT ∥ attempt-specific metadata PUT → manifest CAS | 4 healthy requests; equality verification GET only after immutable Create conflict | `checkpoint.rs`, `snapshots.rs` |
 | Orphan log slot (failure path only) | +1 fresh manifest GET, +HEAD per probe, +Create at next seq | — | `publish.rs::claim_log_slot` |
 
 `healthy_request_round_trip_budgets` in `crates/walgit-server/tests/sim.rs` pins the healthy MemoryStore

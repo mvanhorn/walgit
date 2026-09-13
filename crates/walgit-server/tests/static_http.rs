@@ -1,4 +1,4 @@
-//! HTTP contract of immutable store objects (LFS here; bundles share the same
+//! HTTP contract of immutable store objects (LFS exercises the shared
 //! `static_object` path) and of the embedded UI assets: strong `ETags`, 304,
 //! Range/If-Range, HEAD, Content-Length, precompressed encodings.
 

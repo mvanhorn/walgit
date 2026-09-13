@@ -168,7 +168,6 @@ impl CloudLoggingLayer {
             "task" => "task",
             "push" => "push",
             "maintain" => "maintain",
-            "bundle" => "bundle",
             "remote" => "remote",
             _ => "other",
         }

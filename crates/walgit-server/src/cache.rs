@@ -133,84 +133,6 @@ impl RefAdvertCache {
 }
 
 // ---------------------------------------------------------------------------
-// Bundle list render cache
-// ---------------------------------------------------------------------------
-
-/// Cache key for the rendered bundle list: the repo (freshness = TTL + the
-/// building host's own invalidation, see `BundleListCache`).
-#[derive(Clone, PartialEq, Eq, Hash)]
-struct BundleListKey {
-    repo: String,
-    /// Version (generation) of `bundles/list.pb` the text was rendered from.
-    list_version: String,
-}
-
-/// Cache for rendered bundle list text, keyed by (repo, **version of
-/// `bundles/list.pb`**) — the object a bundle publish actually changes (the
-/// manifest does not; keyed by manifest version it served a 20-minute-stale
-/// list on the very host that had just published, 2026-08-21). One metadata
-/// probe per request decides freshness on every host; the building host also
-/// invalidates. The TTL only bounds memory for repos nobody asks about.
-#[derive(Clone)]
-pub struct BundleListCache {
-    inner: Cache<BundleListKey, String>,
-}
-
-/// Idle lifetime of a rendered list (freshness comes from the version key).
-pub const BUNDLE_LIST_TTL: std::time::Duration = std::time::Duration::from_mins(10);
-
-impl BundleListCache {
-    pub fn new(max_entries: usize) -> Self {
-        Self::with_ttl(max_entries, BUNDLE_LIST_TTL)
-    }
-
-    pub fn with_ttl(max_entries: usize, ttl: std::time::Duration) -> Self {
-        Self {
-            inner: Cache::builder()
-                .max_capacity(max_entries as u64)
-                .time_to_live(ttl)
-                .support_invalidation_closures()
-                .build(),
-        }
-    }
-
-    pub fn get(&self, repo: &str, list_version: &str) -> Option<String> {
-        let key = BundleListKey {
-            repo: repo.to_string(),
-            list_version: list_version.to_string(),
-        };
-        if let Some(val) = self.inner.get(&key) {
-            metrics::counter!("walgit_cache_bundle_list_hit").increment(1);
-            Some(val)
-        } else {
-            metrics::counter!("walgit_cache_bundle_list_miss").increment(1);
-            None
-        }
-    }
-
-    pub fn insert(&self, repo: &str, list_version: &str, text: String) {
-        self.inner.insert(
-            BundleListKey {
-                repo: repo.to_string(),
-                list_version: list_version.to_string(),
-            },
-            text,
-        );
-    }
-
-    /// This host built/published a bundle for `repo`: drop every render of it
-    /// (belt and braces — the version key already misses on the new list).
-    pub fn invalidate(&self, repo: &str) {
-        let repo = repo.to_string();
-        let _ = self.inner.invalidate_entries_if(move |k, _| k.repo == repo);
-    }
-}
-
-// ---------------------------------------------------------------------------
-// ServerCaches — aggregate held by AppState
-// ---------------------------------------------------------------------------
-
-// ---------------------------------------------------------------------------
 // Ref index (web API): exact-name lookups + name-sorted namespaces
 // ---------------------------------------------------------------------------
 
@@ -331,33 +253,21 @@ impl RefIndexCache {
 #[derive(Clone)]
 pub struct ServerCaches {
     pub ref_advert: RefAdvertCache,
-    pub bundle_list: BundleListCache,
     pub ref_index: RefIndexCache,
     /// Rendered sha-addressed web API JSON (immutable): key = repo\0kind\0sha\0path.
     pub api_immutable: Cache<String, bytes::Bytes>,
-    /// `bundles.require` fallback (D17 amendment): when a principal fetched a
-    /// repo's `bundles/list` (`key = repo\0principal` → when), it *tried*
-    /// bundle-uri; a zero-have full fetch from it within the hour is a bundle
-    /// download that failed, and gets ONE upload-pack clone per
-    /// `FALLBACK_EVERY` (the second entry, `repo\0principal\0fallback`).
-    pub bundle_attempts: Cache<String, std::time::Instant>,
 }
 
 impl ServerCaches {
     pub fn new(cfg: &walgit_config::Config) -> Self {
         Self {
             ref_advert: RefAdvertCache::new(cfg.cache.ref_advert_entries),
-            bundle_list: BundleListCache::new(cfg.cache.bundle_list_entries),
             ref_index: RefIndexCache::new(cfg.cache.ref_advert_entries.max(64)),
             api_immutable: Cache::builder()
                 .max_capacity(64 * 1024 * 1024)
                 .weigher(|k: &String, v: &bytes::Bytes| {
                     (k.len() + v.len()).min(u32::MAX as usize) as u32
                 })
-                .build(),
-            bundle_attempts: Cache::builder()
-                .max_capacity(100_000)
-                .time_to_live(std::time::Duration::from_hours(6))
                 .build(),
         }
     }
@@ -476,38 +386,6 @@ mod tests {
         );
     }
 
-    /// A bundle publish changes list.pb, not the manifest: the rendered list
-    /// must expire on its own (prod served a 20-minute-stale list, 2026-08-21).
-    #[tokio::test]
-    async fn bundle_list_cache_expires_without_a_manifest_change() {
-        let c = BundleListCache::with_ttl(8, std::time::Duration::from_millis(60));
-        c.insert("o/r", "g1", "[bundle] one".into());
-        assert_eq!(c.get("o/r", "g1").as_deref(), Some("[bundle] one"));
-        tokio::time::sleep(std::time::Duration::from_millis(120)).await;
-        assert!(
-            c.get("o/r", "g1").is_none(),
-            "idle entry gone after the TTL"
-        );
-    }
-
-    #[test]
-    fn bundle_list_cache_hit_miss() {
-        let cache = BundleListCache::new(16);
-        assert!(cache.get("acme/monorepo", "g1").is_none());
-        cache.insert("acme/monorepo", "g1", "bundle list text".into());
-        assert_eq!(
-            cache.get("acme/monorepo", "g1"),
-            Some("bundle list text".into())
-        );
-        // A new list.pb generation → miss (the invariant); another repo → miss.
-        assert!(cache.get("acme/monorepo", "g2").is_none());
-        assert!(cache.get("acme/other", "g1").is_none());
-        // This host's build → every render of the repo dropped.
-        cache.invalidate("acme/monorepo");
-        std::thread::sleep(std::time::Duration::from_millis(50)); // moka applies closure invalidation lazily
-        assert!(cache.get("acme/monorepo", "g1").is_none());
-    }
-
     #[test]
     fn cache_eviction_by_size() {
         let cache = RefAdvertCache::new(2);
@@ -620,7 +498,7 @@ mod tests {
         // Measure: cache miss (first render).
         let start = Instant::now();
         let mut buf = Vec::with_capacity(4 * 1024 * 1024);
-        repo.advertise_refs_v0(Service::UploadPack, &mut buf)
+        repo.advertise_refs_v0(Service::UploadPack, &mut buf, None)
             .unwrap();
         let render_ms = start.elapsed().as_millis();
         let advert_bytes = buf.len();

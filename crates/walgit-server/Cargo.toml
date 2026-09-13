@@ -12,7 +12,6 @@ walgit-config.workspace = true
 walgit-git.workspace = true
 walgit-wal.workspace = true
 async-trait.workspace = true
-walgit-bundle.workspace = true
 anyhow.workspace = true
 thiserror.workspace = true
 bytes.workspace = true

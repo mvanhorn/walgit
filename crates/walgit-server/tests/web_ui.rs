@@ -100,7 +100,6 @@ async fn overview_reports_push_and_unknown_repo_is_text_404() -> Result<()> {
     assert_eq!(body["repo"], "o/r");
     assert!(body["manifest"]["next_seq"].as_u64().unwrap() >= 2);
     assert!(body["packs"]["pushes"].as_u64().unwrap() >= 1);
-    assert!(body["bundles"].is_array());
     assert!(body["compactions"].is_array());
 
     let missing = client

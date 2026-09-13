@@ -13,14 +13,15 @@
 # Usage:
 #   tests/e2e.sh
 #   WALGIT_TEST_S3_ENDPOINT=http://localhost:9000 tests/e2e.sh
+#   WALGIT=/absolute/path/to/freshly/built/walgit tests/e2e.sh
 #
-# Requires: cargo, git, curl, python3 (for random port).
+# Requires: cargo, git, curl, python3 (for random port), ripgrep (S3 maintenance receipt).
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-WALGIT="$ROOT/target/release/walgit"
+WALGIT="${WALGIT:-}"
 
 # --- helpers -----------------------------------------------------------------
 
@@ -65,17 +66,29 @@ wait_http() {
 
 step "e2e: walgit end-to-end test"
 
-if [[ ! -x "$WALGIT" ]]; then
+if [[ -z "$WALGIT" ]]; then
     step "building walgit (release)..."
     (cd "$ROOT" && cargo build -p walgit-cli --release)
+    WALGIT="$ROOT/target/release/walgit"
 fi
+[[ -x "$WALGIT" ]] || fail "WALGIT must name an executable built from this checkout"
 
 TMP="$(mktemp -d)"
 PIDS=()
 # "${PIDS[@]:-}": bash 3.2 (macOS /bin/bash) calls an empty array expansion an unbound variable
-# under set -u, which aborts the EXIT trap before rm -rf. Same guard as tests/git-bundle-filter.sh:24.
+# under set -u, which aborts the EXIT trap before rm -rf.
 cleanup() { for p in "${PIDS[@]:-}"; do kill "$p" 2>/dev/null || true; done; wait 2>/dev/null || true; rm -rf "$TMP"; }
 trap cleanup EXIT
+
+if [[ -z "${WALGIT_E2E_BASE_URL:-}" ]]; then
+    # Local tests must neither depend on nor change the developer's Git config.
+    export GIT_CONFIG_GLOBAL="$TMP/gitconfig" GIT_CONFIG_NOSYSTEM=1
+    cat > "$GIT_CONFIG_GLOBAL" <<EOF
+[user]
+name = walgit-e2e
+email = e2e@example.invalid
+EOF
+fi
 
 PORT="$(rand_port)"
 
@@ -103,9 +116,7 @@ bucket = "walgit-e2e"
 dir = "$TMP/cache"
 [wal]
 freshness_ttl = "0s"
-[compaction]
-enabled = false
-[bundles]
+[packs]
 enabled = false
 [lfs]
 enabled = false
@@ -220,18 +231,12 @@ pass "tag deleted"
 # --- for-each-ref diff -------------------------------------------------------
 
 step "for-each-ref diff (push vs clone)"
-REFS_WORK=$(cd "$WORK" && git for-each-ref --format='%(refname) %(objectname)')
-REFS_CLONE=$(cd "$CLONE" && git for-each-ref --format='%(refname) %(objectname)' refs/remotes/origin/)
+REFS_WORK=$(cd "$WORK" && git for-each-ref --format='%(refname) %(objectname)' refs/heads/)
+REFS_CLONE=$(cd "$CLONE" && git for-each-ref --format='%(refname) %(objectname)' refs/remotes/origin/ | sed '/^refs\/remotes\/origin\/HEAD /d')
 # Normalize: strip refs/remotes/origin/ prefix from clone refs.
 REFS_CLONE_NORM=$(echo "$REFS_CLONE" | sed 's|refs/remotes/origin/|refs/heads/|g')
-# Only compare heads (tags were deleted).
-REFS_WORK_HEADS=$(echo "$REFS_WORK" | grep '^refs/heads/')
-if [[ "$REFS_WORK_HEADS" != "$REFS_CLONE_NORM" ]]; then
-    # Diff is ok as long as the same main commit exists
-    pass "refs roughly match (heads)"
-else
-    pass "refs match exactly"
-fi
+[[ "$REFS_WORK" == "$REFS_CLONE_NORM" ]] || fail "branch refs differ between push and clone"
+pass "refs match exactly"
 
 # --- delete repo -------------------------------------------------------------
 
@@ -273,9 +278,7 @@ force_path_style = true
 dir = "$TMP/cache-s3"
 [wal]
 freshness_ttl = "0s"
-[compaction]
-enabled = false
-[bundles]
+[packs]
 enabled = false
 [lfs]
 enabled = false
@@ -310,6 +313,16 @@ EOF
     (cd "$TMP/work-s3" && git_auth push -q origin main) || fail "push to A"
     pass "pushed to A"
 
+    step "S3: conserving maintenance from an independent cache"
+    WALGIT__PACKS__ENABLED=true WALGIT__CACHE__DIR="$TMP/cache-maintenance" \
+        "$WALGIT" --config "$TMP/cfg-s3.toml" compact "$REPO2" --base --once \
+        > "$TMP/maintenance.log" 2>&1 || { cat "$TMP/maintenance.log"; fail "maintenance failed"; }
+    # The CLI can log per-repository failures while returning success. Require its
+    # completed checkpoint receipt as well as its exit status.
+    cat "$TMP/maintenance.log"
+    rg -q '; checkpoint at seq [0-9]+' "$TMP/maintenance.log" || fail "maintenance did not finish"
+    pass "conserving maintenance completed"
+
     step "S3: clone from B (cross-instance consistency)"
     git_auth clone -q "$BASE_B/$REPO2.git" "$TMP/clone-s3" || fail "clone from B"
     HEAD_A=$(cd "$TMP/work-s3" && git rev-parse main)
@@ -325,8 +338,9 @@ EOF
 
     step "S3: for-each-ref diff"
     REFS_A=$(cd "$TMP/work-s3" && git for-each-ref --format='%(refname) %(objectname)' refs/heads/)
-    REFS_B=$(cd "$TMP/clone-s3" && git for-each-ref --format='%(refname) %(objectname)' refs/remotes/origin/ | sed 's|refs/remotes/origin/|refs/heads/|g')
-    [[ "$REFS_A" == "$REFS_B" ]] && pass "refs match" || pass "refs roughly match"
+    REFS_B=$(cd "$TMP/clone-s3" && git for-each-ref --format='%(refname) %(objectname)' refs/remotes/origin/ | sed '/^refs\/remotes\/origin\/HEAD /d; s|refs/remotes/origin/|refs/heads/|g')
+    [[ "$REFS_A" == "$REFS_B" ]] || fail "branch refs differ between S3 instances"
+    pass "refs match exactly"
 
     kill "$SERVER_A_PID" "$SERVER_B_PID" 2>/dev/null || true
 fi

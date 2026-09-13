@@ -5,8 +5,9 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+sha2.workspace = true
+hex.workspace = true
 tracing.workspace = true
-cron.workspace = true
 anyhow.workspace = true
 serde.workspace = true
 toml.workspace = true

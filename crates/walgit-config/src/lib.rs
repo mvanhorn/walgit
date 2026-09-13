@@ -2,6 +2,11 @@
 //! `WALGIT__SECTION__KEY=value` (double underscore = nesting), applied after
 //! the file is parsed. `PORT` (a serverless host) overrides `server.listen` port.
 
+pub mod packs;
+pub use packs::{DeltaBudget, FoldInventory, FoldReason, FreezeReason, PacksConfig};
+pub mod refs;
+pub use refs::{PackGroupConfig, PackGroupKind, RefsConfig};
+
 use std::{net::SocketAddr, path::PathBuf, time::Duration};
 
 use anyhow::{Context, Result};
@@ -17,8 +22,9 @@ pub struct Config {
     pub store: StoreConfig,
     pub cache: CacheConfig,
     pub wal: WalConfig,
-    pub compaction: CompactionConfig,
-    pub bundles: BundlesConfig,
+    pub packs: PacksConfig,
+    pub refs: RefsConfig,
+    pub packfile_uri: PackfileUriConfig,
     pub maintenance: MaintenanceConfig,
     pub placement: PlacementConfig,
     pub lfs: LfsConfig,
@@ -50,16 +56,16 @@ pub struct ServerConfig {
     /// Max size of a single pushed pack accepted over HTTP.
     pub max_push_bytes: ByteSize,
     /// Roles this instance performs. a serverless host: fronts get `["serve"]`, the
-    /// single maintenance instance `["maintain"]` (checkpoint / bundle / compact
-    /// loops over every repo; `compact` and `bundle` are its sub-roles). Empty = all.
+    /// single maintenance instance `["maintain"]` (checkpoint / compact
+    /// loops over every repo; `compact` is its sub-role). Empty = all.
     pub roles: Vec<Role>,
     pub auth: AuthConfig,
-    /// Public base URL used when rendering absolute URIs (bundle lists, LFS).
+    /// Public base URL used when rendering absolute URIs (LFS, clone recipes).
     pub public_url: Option<String>,
     /// Create a repo on the first receive-pack push if it does not exist.
     pub auto_create_on_push: bool,
     /// Honour `X-Walgit-Capabilities: accel-redirect` from an nginx edge
-    /// (`deploy/nginx.conf.example`): static objects (bundles, LFS) are answered with
+    /// (`deploy/nginx.conf.example`): static objects (LFS) are answered with
     /// `X-Accel-Redirect: /_store/` + `X-Walgit-Store-Url` (and `-Authorization`) and no
     /// body, so nginx streams (and caches) the bytes itself. Only turn it on behind an
     /// edge that strips the capability header from clients: the answer carries a store
@@ -123,10 +129,8 @@ impl Default for TlsConfig {
 pub enum Role {
     Serve,
     Compact,
-    Bundle,
-    /// Background maintenance loop: checkpoint-if-due (refs-level), bundles-if-
-    /// due, geometric compaction for repos whose pack set fits. Implies
-    /// `Compact` + `Bundle`.
+    /// Background maintenance loop: checkpoints and geometric compaction
+    /// for repos whose pack set fits. Implies `Compact`.
     Maintain,
     /// The events bridge (`docs/EVENTS.md`): tails every repo's WAL from a
     /// per-repo cursor and publishes `ref` events to the bus sinks (webhook,
@@ -139,7 +143,7 @@ pub enum Role {
 #[serde(deny_unknown_fields, default)]
 pub struct AuthConfig {
     pub mode: AuthMode,
-    /// Allow unauthenticated read (upload-pack, bundles, web UI) when mode != none.
+    /// Allow unauthenticated read (upload-pack, LFS, web UI) when mode != none.
     pub anonymous_read: bool,
     /// Static tokens (`token` mode, and accepted in `oidc` mode too — for robots): token → principal.
     /// Presented as `Authorization: Bearer <token>` or as the password of HTTP Basic.
@@ -256,7 +260,7 @@ pub struct GcsConfig {
     /// Service account for signed URLs; None = ADC/IAM signBlob.
     pub signing_service_account: Option<String>,
     /// Separate data clients (own channels) for bulk traffic — pack/idx/side-
-    /// file/bundle/LFS bytes and ranged reads — so the control plane
+    /// file/LFS bytes and ranged reads — so the control plane
     /// (manifest, log, checkpoint, lease GETs/PUTs) never queues behind a
     /// multi-GB download on a shared HTTP/2 connection.
     #[serde(default = "default_bulk_clients")]
@@ -316,8 +320,6 @@ pub struct CacheConfig {
     pub ref_advert_entries: usize,
     /// Max entries in the object-info (size/has) cache.
     pub object_info_entries: usize,
-    /// Max entries in the bundle list render cache.
-    pub bundle_list_entries: usize,
     /// Process-wide LRU of pack data blocks (1 MiB range reads) used when a
     /// repo's pack set does not fit `max_bytes` and objects are read straight
     /// from the object store.
@@ -376,7 +378,7 @@ pub struct WalConfig {
     /// Skip the index freshness GET if the last check was younger than this (0 = always check).
     #[serde(with = "humantime_serde")]
     pub freshness_ttl: Duration,
-    /// After a refs-only sync (info/refs, ls-refs, bundle-uri, web refs) on a
+    /// After a refs-only sync (info/refs, ls-refs, web refs) on a
     /// copy whose packs are not yet reconciled, start downloading the packs in
     /// the background so the first fetch does not pay for it.
     pub prefetch_packs: bool,
@@ -472,9 +474,9 @@ impl Default for MaintenanceConfig {
 /// * **serve**: object work — `git-upload-pack`, `git-receive-pack`, LFS transfer. A
 ///   host that does not serve a repo answers those with 503 + `Retry-After` (+ a band-3
 ///   line naming the host that does) *before* any sync or materialize; refs-level
-///   reads (info/refs, the API via the remote reader, UI, bundle list) stay available
+///   reads (info/refs, the API via the remote reader, UI) stay available
 ///   everywhere, so the edge's read-only fallback (D29) works.
-/// * **maintain**: the maintainer loop's units (checkpoints, bundles, compaction,
+/// * **maintain**: the maintainer loop's units (checkpoints, compaction,
 ///   fsck/repair) — only on hosts with the `maintain` role.
 ///
 /// Placement is by rule, not by capacity: a repo is either this host's or not.
@@ -510,156 +512,19 @@ impl PlacementConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields, default)]
-pub struct CompactionConfig {
-    pub enabled: bool,
-    /// Geometric factor between tiers.
-    pub factor: u32,
-    /// Compact when this many fresh (tier 0) packs exist.
-    pub trigger_packs: usize,
-    /// Or when fresh pack bytes exceed this.
-    pub trigger_bytes: ByteSize,
-    #[serde(with = "humantime_serde")]
-    pub lease_ttl: Duration,
-    /// Keep superseded packs and old index generations for this long (provenance/rewind).
-    #[serde(with = "humantime_serde")]
-    pub retention_superseded: Duration,
-    /// Use upstream git for delta compression (`git repack`); gix does not delta-compress.
-    pub engine: RepackEngine,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
-pub enum RepackEngine {
-    #[default]
-    Git,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields, default)]
-#[expect(
-    clippy::struct_excessive_bools,
-    reason = "Independent configuration switches, not mutually exclusive states"
-)]
-pub struct BundlesConfig {
-    pub enabled: bool,
-    pub strategy: Vec<BundleStrategy>,
-    /// Minimum-size gate for **incremental** slots: a slot whose content
-    /// (commits on the bundle's refs since its base bundle's tips) has fewer
-    /// commits than this is not built (plan state `too-small`; the next slot of
-    /// the strategy is built on the same base, so nothing is lost). Fulls are
-    /// never gated. 0 = no gate. Per-strategy `min_commits` overrides.
-    #[serde(default = "default_min_commits")]
-    pub min_commits: u64,
-    /// Optional second guard: skip incrementals whose pack would be smaller
-    /// than this (0 = off).
-    #[serde(default)]
-    pub min_bytes: ByteSize,
-    pub serve_via: BundleServe,
-    #[serde(with = "humantime_serde")]
-    pub signed_url_ttl: Duration,
-    /// Advertise `bundle-uri` in protocol v2 capabilities.
-    pub advertise: bool,
-    /// Put the filtered families INTO the plain `bundles/list` and the v2
-    /// advertisement (with their `bundle.<id>.filter` lines) instead of only
-    /// at `bundles/list?filter=…`. Only for clients whose git matches
-    /// `bundle.<id>.filter` against the clone's filter (a patched Git client
-    /// patch, `docs/patches/`): stock git ignores the key and a full clone
-    /// would swallow the blobless bundles (design §6b). Default false.
-    #[serde(default)]
-    pub advertise_filtered: bool,
-    /// Repositories (`owner/name`, or `owner/*`) whose clones **must** go
-    /// through bundle-uri: a fetch with zero `have`s gets a pkt ERR / band-3
-    /// message with the exact fix instead of an impossible full pack. Fetches
-    /// with haves proceed normally.
-    #[serde(default)]
-    pub require: Vec<String>,
-    /// Repositories (`owner/name` | `owner/*`) whose bundle URIs are always
-    /// signed store URLs regardless of `serve_via`: clone bytes of the biggest
-    /// repos bypass the fronts entirely.
-    #[serde(default)]
-    pub signed_url_for: Vec<String>,
-    /// Default ref set of a bundle when a strategy has no `refs`: `HEAD` +
-    /// `refs/heads/main` when true (branches are tiny per-fetch deltas on top
-    /// of main; bundling every branch makes rebased branches *slower* to
-    /// fetch, not faster), `refs/heads/*` + `refs/tags/*` + `HEAD` when false.
-    #[serde(default = "default_true")]
-    pub main_only: bool,
-    /// Extra ref globs added to every bundle's default ref set (e.g. `refs/tags/v*`).
-    #[serde(default)]
-    pub extra_refs: Vec<String>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum BundleServe {
+pub enum LfsServe {
     #[default]
     Proxy,
     SignedUrl,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct BundleStrategy {
-    pub name: String,
-    pub kind: BundleKind,
-    /// Cron expression (6 or 7 fields, `cron` crate syntax) or "@hourly"/"@daily"/"@weekly".
-    pub schedule: String,
-    /// For incremental: name of the strategy this one is based on.
-    #[serde(default)]
-    pub base: Option<String>,
-    /// Full strategies only: how many newest fulls stay listed (>= 1). Incrementals have
-    /// no knob — always the 2 newest whose base is kept (`walgit_bundle::slots::INCREMENTALS_KEPT`,
-    /// D21 amended 2026-08-22); setting `keep` on one is a configuration error.
-    #[serde(default)]
-    pub keep: usize,
-    /// Ref globs included in the bundle. Default: see `bundles.main_only`.
-    #[serde(default)]
-    pub refs: Vec<String>,
-    /// Backfill horizon: how many missing slots (oldest first) one maintainer
-    /// pass may build for this strategy (0 = unlimited). Keeps a long outage
-    /// from turning into hours of catch-up in one pass.
-    #[serde(default)]
-    pub backfill_max: usize,
-    /// Override of `bundles.min_commits` for this strategy (None = inherit).
-    #[serde(default)]
-    pub min_commits: Option<u64>,
-    /// Object filter of the bundles this strategy builds (`"blob:none"` is the
-    /// only supported value): a **blobless family** for `--filter=blob:none`
-    /// clones. A full strategy with a filter composes the D18 history pack
-    /// (commits + trees) under a `@filter=blob:none` header; incrementals pack
-    /// with `--filter=blob:none`. Whole chains share one filter. Filtered
-    /// bundles are advertised only at `bundles/list?filter=blob:none` — never
-    /// in the protocol-advertised list: git (2.47 … master) does not match
-    /// `bundle.<id>.filter` against the clone's filter, so a full clone would
-    /// swallow them and end up with promisor packs it cannot complete.
-    #[serde(default)]
-    pub filter: Option<String>,
-    /// Incrementals only. `false` (default, D21): every slot is cut on its **base** (a daily on the
-    /// weekly, an hourly on the newest daily), so the newest one subsumes the older ones and only the
-    /// 2 newest are listed — a fresh clone is 5 downloads, a catch-up ≤ 2, bytes overlap.
-    /// `true`: a slot is cut on this strategy's **own previous bundle** when that one is newer than
-    /// the newest base bundle at or before the slot (dailies chain from the weekly, hourlies restart
-    /// from each daily); every slot since the base is listed (≤ 7 dailies, ≤ 24 hourlies) and each
-    /// carries exactly its delta — more downloads, no overlapping bytes, a catch-up is exactly the
-    /// slots missed. `walgit_bundle::slots` is the one place that knows either rule.
-    #[serde(default)]
-    pub chain: bool,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum BundleKind {
-    Full,
-    Incremental,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct LfsConfig {
     pub enabled: bool,
-    pub serve_via: BundleServe,
+    pub serve_via: LfsServe,
     #[serde(with = "humantime_serde")]
     pub signed_url_ttl: Duration,
     pub max_object_bytes: ByteSize,
@@ -700,7 +565,7 @@ pub struct UpstreamConfig {
     reason = "Independent configuration switches, not mutually exclusive states"
 )]
 pub struct GitConfig {
-    /// Path to the upstream git binary (repack, bundle, optional upload-pack engine).
+    /// Path to the upstream git binary (repack, optional upload-pack engine).
     pub binary: PathBuf,
     pub upload_pack_engine: UploadPackEngine,
     pub allow_filter: bool,
@@ -812,15 +677,13 @@ pub enum LogFormat {
     Pretty,
 }
 
-fn default_min_commits() -> u64 {
-    25
-}
 fn default_true() -> bool {
     true
 }
 
 /// D24: the top-level sections a repository's settings may override.
-pub const SETTINGS_SECTIONS: &[&str] = &["bundles", "maintenance", "compaction", "upstream"];
+pub const SETTINGS_SECTIONS: &[&str] =
+    &["maintenance", "packs", "upstream", "refs", "packfile_uri"];
 /// D24: maximum size of a settings document.
 pub const SETTINGS_MAX_BYTES: usize = 16 * 1024;
 
@@ -897,102 +760,6 @@ impl Config {
             CacheMode::Budget => false,
             CacheMode::Auto => self.maintenance.disk == MaintainerDisk::Ssd,
         }
-    }
-    /// Bundle strategies form chains of calendar slots (`docs/BUNDLE_URI_DESIGN.md` §4):
-    /// every `schedule` is a 6-field UTC cron (or an `@alias`) that parses; an
-    /// incremental names a `base` that exists and whose chain ends in a full
-    /// strategy; each chain has exactly one full root; `keep >= 1` on fulls.
-    fn validate_bundle_strategies(&self) -> Result<()> {
-        use std::collections::HashMap;
-        let strategies = &self.bundles.strategy;
-        let by_name: HashMap<&str, &BundleStrategy> =
-            strategies.iter().map(|s| (s.name.as_str(), s)).collect();
-        anyhow::ensure!(
-            by_name.len() == strategies.len(),
-            "bundles.strategy: duplicate strategy names"
-        );
-        for s in strategies {
-            let expr = s.schedule.trim();
-            let fields = expr.split_whitespace().count();
-            anyhow::ensure!(
-                expr.starts_with('@') || fields == 6 || fields == 7,
-                "bundles.strategy {}: schedule {:?} must be a 6-field UTC cron (sec min hour dom mon dow) or @hourly/@daily/@weekly",
-                s.name,
-                s.schedule
-            );
-            cron::Schedule::from_str(expr).map_err(|e| {
-                anyhow::anyhow!(
-                    "bundles.strategy {}: schedule {:?} does not parse: {e}",
-                    s.name,
-                    s.schedule
-                )
-            })?;
-            if let Some(f) = &s.filter {
-                anyhow::ensure!(
-                    f == "blob:none",
-                    "bundles.strategy {}: filter {f:?} is not supported (only \"blob:none\")",
-                    s.name
-                );
-            }
-            match s.kind {
-                BundleKind::Full => {
-                    anyhow::ensure!(
-                        s.base.is_none(),
-                        "bundles.strategy {}: a full strategy has no base",
-                        s.name
-                    );
-                    anyhow::ensure!(
-                        !s.chain,
-                        "bundles.strategy {}: `chain` is an incremental knob",
-                        s.name
-                    );
-                    anyhow::ensure!(
-                        s.keep >= 1,
-                        "bundles.strategy {}: keep must be >= 1 on a full strategy",
-                        s.name
-                    );
-                }
-                BundleKind::Incremental => {
-                    anyhow::ensure!(
-                        s.keep == 0,
-                        "bundles.strategy {}: `keep` is not a knob on an incremental strategy — the 2 newest whose base is kept are always listed (D21, 2026-08-22); remove it",
-                        s.name
-                    );
-                    let mut cur = s;
-                    let mut hops = 0;
-                    loop {
-                        let base = cur.base.as_deref().ok_or_else(|| {
-                            anyhow::anyhow!("bundles.strategy {}: incremental needs base", cur.name)
-                        })?;
-                        let b = by_name.get(base).ok_or_else(|| {
-                            anyhow::anyhow!(
-                                "bundles.strategy {}: base {base} is not a strategy",
-                                cur.name
-                            )
-                        })?;
-                        anyhow::ensure!(
-                            b.filter == s.filter,
-                            "bundles.strategy {}: filter {:?} differs from its base {}'s {:?} (a chain shares one filter)",
-                            s.name,
-                            s.filter,
-                            b.name,
-                            b.filter
-                        );
-                        if b.kind == BundleKind::Full {
-                            break;
-                        }
-                        cur = b;
-                        hops += 1;
-                        anyhow::ensure!(
-                            hops < 16,
-                            "bundles.strategy {}: base chain has a cycle",
-                            s.name
-                        );
-                    }
-                }
-            }
-        }
-        Ok(())
     }
 }
 
@@ -1116,7 +883,6 @@ impl Default for CacheConfig {
             prewarm_ready_timeout: Duration::ZERO,
             ref_advert_entries: 256,
             object_info_entries: 4096,
-            bundle_list_entries: 128,
             remote_block_bytes: ByteSize::gib(1),
             remote_object_bytes: ByteSize::mib(256),
             shared_render_cache: true,
@@ -1145,80 +911,11 @@ impl Default for WalConfig {
         }
     }
 }
-impl Default for CompactionConfig {
-    fn default() -> Self {
-        CompactionConfig {
-            enabled: true,
-            factor: 2,
-            trigger_packs: 16,
-            trigger_bytes: ByteSize::gib(1),
-            lease_ttl: Duration::from_mins(10),
-            retention_superseded: Duration::from_hours(168),
-            engine: RepackEngine::Git,
-        }
-    }
-}
-impl Default for BundlesConfig {
-    fn default() -> Self {
-        BundlesConfig {
-            enabled: true,
-            strategy: vec![
-                BundleStrategy {
-                    name: "weekly".into(),
-                    kind: BundleKind::Full,
-                    // Sunday 23:00 UTC (slot = fire time; backfilled when missed).
-                    schedule: "0 0 23 * * Sun".into(),
-                    base: None,
-                    keep: 2,
-                    refs: vec![],
-                    backfill_max: 0,
-                    min_commits: None,
-                    filter: None,
-                    chain: false,
-                },
-                BundleStrategy {
-                    name: "daily".into(),
-                    kind: BundleKind::Incremental,
-                    schedule: "0 0 23 * * *".into(),
-                    base: Some("weekly".into()),
-                    keep: 0,
-                    refs: vec![],
-                    backfill_max: 0,
-                    min_commits: None,
-                    filter: None,
-                    chain: true,
-                },
-                BundleStrategy {
-                    name: "hourly".into(),
-                    kind: BundleKind::Incremental,
-                    schedule: "@hourly".into(),
-                    base: Some("daily".into()),
-                    keep: 0,
-                    refs: vec![],
-                    backfill_max: 0,
-                    min_commits: None,
-                    filter: None,
-                    chain: false,
-                },
-            ],
-            serve_via: BundleServe::Proxy,
-            signed_url_ttl: Duration::from_hours(1),
-            advertise: true,
-            advertise_filtered: false,
-            require: Vec::new(),
-            signed_url_for: Vec::new(),
-            main_only: true,
-            extra_refs: Vec::new(),
-            min_commits: 25,
-            min_bytes: ByteSize::b(0),
-        }
-    }
-}
 impl Default for LfsConfig {
     fn default() -> Self {
         LfsConfig {
             enabled: true,
-            serve_via: BundleServe::Proxy,
+            serve_via: LfsServe::Proxy,
             signed_url_ttl: Duration::from_hours(1),
             max_object_bytes: ByteSize::gib(16),
         }
@@ -1380,6 +1077,16 @@ impl Config {
     }
 
     pub fn validate(&self) -> Result<()> {
+        self.refs.validate()?;
+        self.packs.validate()?;
+        anyhow::ensure!(
+            self.packfile_uri.uri_min_bytes.as_u64() > 0,
+            "packfile_uri.uri_min_bytes must be positive"
+        );
+        anyhow::ensure!(
+            (1..=64).contains(&self.packfile_uri.max_uris_per_fetch),
+            "packfile_uri.max_uris_per_fetch must be 1..=64"
+        );
         anyhow::ensure!(!self.store.bucket.is_empty(), "store.bucket must be set");
         let t = &self.server.tls;
         match t.mode {
@@ -1405,7 +1112,6 @@ impl Config {
                 "server.public_url must be an http(s) origin (got {u})"
             );
         }
-        self.validate_bundle_strategies()?;
         // You cannot maintain what you refuse to serve: a host with the serve role
         // whose maintain rules name a repository its serve rules exclude is a config
         // error (the SSD host 2026-08-21 07:00Z: maintain = ["acme/monorepo"], inherited
@@ -1529,46 +1235,7 @@ impl Config {
                 "server.auth.session_secret is required with oauth_client_id (it signs sessions and access tokens)"
             );
         }
-        anyhow::ensure!(
-            self.compaction.factor >= 2,
-            "compaction.factor must be >= 2"
-        );
         anyhow::ensure!(self.wal.max_batch >= 1, "wal.max_batch must be >= 1");
-        let names: std::collections::HashSet<&str> = self
-            .bundles
-            .strategy
-            .iter()
-            .map(|s| s.name.as_str())
-            .collect();
-        anyhow::ensure!(
-            names.len() == self.bundles.strategy.len(),
-            "bundle strategy names must be unique"
-        );
-        for s in &self.bundles.strategy {
-            match (s.kind, &s.base) {
-                (BundleKind::Incremental, None) => {
-                    anyhow::bail!("bundle strategy {} is incremental but has no base", s.name)
-                }
-                (BundleKind::Incremental, Some(b)) => {
-                    anyhow::ensure!(
-                        names.contains(b.as_str()),
-                        "bundle strategy {} base {b} does not exist",
-                        s.name
-                    );
-                }
-                (BundleKind::Full, Some(_)) => {
-                    anyhow::bail!("bundle strategy {} is full but has a base", s.name)
-                }
-                _ => {}
-            }
-            if matches!(s.kind, BundleKind::Full) {
-                anyhow::ensure!(
-                    s.keep >= 1,
-                    "bundle strategy {}: keep must be >= 1 on a full strategy",
-                    s.name
-                );
-            }
-        }
         if let Some(u) = &self.events.webhook_url {
             anyhow::ensure!(
                 u.starts_with("http://") || u.starts_with("https://"),
@@ -1585,21 +1252,6 @@ impl Config {
             String::new()
         } else {
             format!("{p}/")
-        }
-    }
-
-    /// Whether `owner/name` is listed in `bundles.require` (exact or `owner/*`).
-    pub fn bundles_required(&self, owner: &str, name: &str) -> bool {
-        repo_listed(&self.bundles.require, owner, name)
-    }
-
-    /// How `owner/name`'s bundle URIs are served: `bundles.serve_via`, or
-    /// signed URLs when listed in `bundles.signed_url_for`.
-    pub fn bundle_serve_via(&self, owner: &str, name: &str) -> BundleServe {
-        if repo_listed(&self.bundles.signed_url_for, owner, name) {
-            BundleServe::SignedUrl
-        } else {
-            self.bundles.serve_via
         }
     }
 
@@ -1644,8 +1296,7 @@ impl Config {
     pub fn has_role(&self, role: Role) -> bool {
         self.server.roles.is_empty()
             || self.server.roles.contains(&role)
-            || (matches!(role, Role::Compact | Role::Bundle)
-                && self.server.roles.contains(&Role::Maintain))
+            || (matches!(role, Role::Compact) && self.server.roles.contains(&Role::Maintain))
     }
 }
 
@@ -1696,12 +1347,17 @@ mod tests {
     fn defaults_parse_and_validate() {
         let c = Config::parse("").unwrap();
         assert_eq!(c.server.listen.port(), 8080);
-        assert_eq!(c.bundles.strategy.len(), 3);
         c.validate().unwrap();
         // Round trip through TOML.
         let text = toml::to_string(&c).unwrap();
         let back = Config::parse(&text).unwrap();
         assert_eq!(back.store.bucket, c.store.bucket);
+    }
+
+    #[test]
+    fn example_configurations_parse_and_validate() {
+        Config::parse(include_str!("../../../walgit.example.toml")).unwrap();
+        Config::parse(include_str!("../../../walgit.standalone.toml")).unwrap();
     }
 
     #[test]
@@ -1859,26 +1515,58 @@ mod tests {
     }
 
     #[test]
+    fn removed_bundle_configuration_is_rejected() {
+        for input in [
+            "[bundles]\nenabled = true\n",
+            "[server]\nroles = [\"bundle\"]\n",
+            "[cache]\nbundle_list_entries = 128\n",
+        ] {
+            assert!(Config::parse(input).is_err(), "{input}");
+        }
+        let mut base = Config::default();
+        base.store.bucket = "b".into();
+        assert!(base.with_settings("[bundles]\nenabled = false\n").is_err());
+        assert!(!base.public_settings_toml().unwrap().contains("[bundles]"));
+    }
+
+    #[test]
+    fn removed_compaction_configuration_is_rejected() {
+        for input in [
+            "[compaction]\nenabled = true\n",
+            "[packs]\nfactor = 2\n",
+            "[packs]\ntrigger_bytes = \"1GiB\"\n",
+            "[packs]\nretention_superseded = \"7d\"\n",
+            "[packs]\nengine = \"git\"\n",
+        ] {
+            assert!(Config::parse(input).is_err(), "{input}");
+            assert!(Config::default().with_settings(input).is_err(), "{input}");
+        }
+        assert!(
+            !Config::default()
+                .public_settings_toml()
+                .unwrap()
+                .contains("[compaction]")
+        );
+    }
+
+    #[test]
     fn settings_merge_over_config_and_are_restricted() {
         let mut base = Config::default();
         base.store.bucket = "b".into();
         let eff = base
             .with_settings(
                 r"
-[bundles]
-min_commits = 3
-main_only = false
+[packs]
+geometric_factor = 3
 [maintenance]
 checkpoints = false
 ",
             )
             .unwrap();
-        assert_eq!(eff.bundles.min_commits, 3);
-        assert!(!eff.bundles.main_only);
+        assert_eq!(eff.packs.geometric_factor, 3);
         assert!(!eff.maintenance.checkpoints);
         assert_eq!(
-            eff.bundles.strategy.len(),
-            base.bundles.strategy.len(),
+            eff.packs.fold_when_fresh_packs_reach, base.packs.fold_when_fresh_packs_reach,
             "untouched keys keep the host's values"
         );
         // Forbidden section.
@@ -1893,16 +1581,16 @@ listen = \"0.0.0.0:1\"\n",
         // A section the docs once promised but the code never accepted.
         assert!(base.with_settings("[integrations]\nx = 1\n").is_err());
         // Unknown key inside an allowed section.
-        assert!(base.with_settings("[bundles]\nnope = 1\n").is_err());
-        // Invalid effective config (incremental without a base).
+        assert!(base.with_settings("[packs]\nnope = 1\n").is_err());
+        // Invalid effective config (geometric factor below two).
         let e = base
-            .with_settings("[[bundles.strategy]]\nname = \"x\"\nkind = \"incremental\"\nschedule = \"@hourly\"\n")
+            .with_settings("[packs]\ngeometric_factor = 1\n")
             .unwrap_err()
             .to_string();
         assert!(e.contains("settings"), "{e}");
         assert_eq!(
-            base.with_settings("  ").unwrap().bundles.min_commits,
-            base.bundles.min_commits
+            base.with_settings("  ").unwrap().packs.geometric_factor,
+            base.packs.geometric_factor
         );
         let e = base
             .with_settings("[upstream]\ntoken_env = \"AWS_SECRET_ACCESS_KEY\"\n")
@@ -1910,7 +1598,7 @@ listen = \"0.0.0.0:1\"\n",
             .to_string();
         assert!(e.contains("token_env"), "{e}");
         let pub_toml = base.public_settings_toml().unwrap();
-        assert!(pub_toml.contains("[bundles]"), "{pub_toml}");
+        assert!(pub_toml.contains("[packs]"), "{pub_toml}");
         assert!(!pub_toml.contains("session_secret"), "{pub_toml}");
         assert!(!pub_toml.contains("[server]"), "{pub_toml}");
         assert!(!pub_toml.contains("token_env"), "{pub_toml}");
@@ -1993,62 +1681,20 @@ webhook_secret = "s"
         let err = Config::parse("[events]\nwebhook_url = \"ftp://x\"\n").unwrap_err();
         assert!(err.to_string().contains("webhook_url"), "{err}");
     }
-
-    #[test]
-    fn rejects_bad_bundle_graph() {
-        let text = r#"
-[[bundles.strategy]]
-name = "daily"
-kind = "incremental"
-schedule = "@daily"
-keep = 3
-"#;
-        assert!(Config::parse(text).is_err());
-    }
 }
 
-#[cfg(test)]
-mod bundle_strategy_validation {
-    use super::*;
-
-    fn base() -> Config {
-        let mut c = Config::default();
-        c.store.bucket = "b".into();
-        c
-    }
-
-    #[test]
-    fn defaults_validate() {
-        base().validate().unwrap();
-    }
-
-    #[test]
-    fn bad_schedule_incremental_without_full_root_and_keep_zero_are_rejected() {
-        let mut c = base();
-        c.bundles.strategy[2].schedule = "every hour".into();
-        assert!(c.validate().unwrap_err().to_string().contains("schedule"));
-        let mut c = base();
-        c.bundles.strategy[1].base = Some("nope".into());
-        assert!(
-            c.validate()
-                .unwrap_err()
-                .to_string()
-                .contains("not a strategy")
-        );
-        let mut c = base();
-        c.bundles.strategy[0].keep = 0;
-        assert!(c.validate().unwrap_err().to_string().contains("keep"));
-        let mut c = base();
-        c.bundles.strategy[2].keep = 28;
-        assert!(
-            c.validate()
-                .unwrap_err()
-                .to_string()
-                .contains("not a knob on an incremental")
-        );
-        let mut c = base();
-        c.bundles.strategy[1].base = Some("hourly".into());
-        c.bundles.strategy[2].base = Some("daily".into());
-        assert!(c.validate().unwrap_err().to_string().contains("cycle"));
+/// Negotiated static delivery thresholds. Foundation only: no URI emission yet.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct PackfileUriConfig {
+    pub uri_min_bytes: ByteSize,
+    pub max_uris_per_fetch: usize,
+}
+impl Default for PackfileUriConfig {
+    fn default() -> Self {
+        Self {
+            uri_min_bytes: ByteSize::mib(32),
+            max_uris_per_fetch: 64,
+        }
     }
 }

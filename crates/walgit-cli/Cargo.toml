@@ -24,7 +24,6 @@ walgit-config.workspace = true
 walgit-git.workspace = true
 walgit-wal.workspace = true
 walgit-server.workspace = true
-walgit-bundle = { path = "../walgit-bundle", features = ["wal"] }
 gix-hash.workspace = true
 anyhow.workspace = true
 tokio.workspace = true

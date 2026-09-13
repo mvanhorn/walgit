@@ -244,20 +244,14 @@ impl GcsStore {
         reason = "Object store control keys use exact case-sensitive suffixes"
     )]
     fn is_bulk_key(key: &str) -> bool {
-        // Pack data + side-files, bundle *files* (not `bundles/list.pb`), LFS
-        // objects. Everything else — manifest, log, checkpoints, leases,
-        // bundle list, policy — is control plane and must never wait for a
-        // bulk permit (prod 2026-08-20: `bundles/list.pb` (753 B) classified
-        // bulk sat 455–472 s behind 32 stripes on the bulk semaphore while
-        // info/refs waited for it).
+        // Packs and LFS are bulk; manifests, logs, checkpoints, leases and policy
+        // stay on the control transport even during a large transfer.
         let name = key.rsplit('/').next().unwrap_or(key);
         if name.ends_with(".pb") || name.ends_with(".json") {
             return false;
         }
         key.contains("/wal/")
             || key.starts_with("wal/")
-            || key.contains("/bundles/")
-            || key.starts_with("bundles/")
             || key.contains("/lfs/")
             || key.starts_with("lfs/")
     }
@@ -1511,7 +1505,6 @@ mod bulk_key_tests {
             "prefix/repos/o/r/log/0000000000000001.pb",
             "prefix/repos/o/r/checkpoints/0000000000000001/refs.pb",
             "prefix/repos/o/r/leases/compact.pb",
-            "prefix/repos/o/r/bundles/list.pb",
             "prefix/repos/o/r/policy.json",
             "prefix/repos/o/r/cache/api/v1/abc.json",
         ] {
@@ -1521,7 +1514,6 @@ mod bulk_key_tests {
             "prefix/repos/o/r/wal/abc.pack",
             "prefix/repos/o/r/wal/abc.idx",
             "prefix/repos/o/r/wal/abc.commit-graph",
-            "prefix/repos/o/r/bundles/weekly/2026-abc.bundle",
             "prefix/repos/o/r/lfs/objects/ab/cd/abcd",
         ] {
             assert!(GcsStore::is_bulk_key(k), "{k} must be bulk");

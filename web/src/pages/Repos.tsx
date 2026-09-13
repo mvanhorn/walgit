@@ -26,7 +26,7 @@ export function Repos() {
               </Link>
               <div className="muted small">
                 <code>
-                  git -c transfer.bundleURI=true clone {location.origin}/{owner}/{r}.git
+                  git clone {location.origin}/{owner}/{r}.git
                 </code>
               </div>
             </li>

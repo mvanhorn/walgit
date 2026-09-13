@@ -235,6 +235,7 @@ fn req(
         shallow: vec![],
         want_refs: vec![],
         packfile_uris_protocols: vec![],
+        packfile_indexes: false,
     }
 }
 

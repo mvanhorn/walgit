@@ -35,8 +35,7 @@ export function CloneSetup({ repo, compact = false }: { repo: string; compact?: 
             )
           </>
         )}
-        , stores it in a file only you can read, installs a git credential helper that hands it to git, configures
-        bundle URIs and clones. Idempotent: re-run any time. Needs git ≥ 2.46 and curl.
+        , stores it in a file only you can read, installs a git credential helper that hands it to git, and clones. Idempotent: re-run any time. Needs git ≥ 2.46 and curl.
       </div>
       <CodeSample code={r.install} />
       <div className="small strong">Already set up</div>
@@ -51,27 +50,21 @@ export function CloneSetup({ repo, compact = false }: { repo: string; compact?: 
       </div>
       {!compact && (
         <p className="small muted">
-          Initial clones bootstrap from immutable static bundles (bundle-uri); upload-pack only sends the remainder.
-          Every recipe passes <code>-c fetch.bundleURI=…/bundles/catchup</code> (the list without the fulls: a fetch only
-          ever needs incremental links): git records no list for an advertised
-          bundle-uri clone, and without it later <code>git fetch</code>es would skip the bundles. The installer sets
-          <code>transfer.bundleURI=true</code> and <code>fetch.uriProtocols=https</code> globally. When the server rejects the
+          The credential helper authenticates clones, fetches and pushes. When the server rejects the
           token (a real 401) git erases it from the helper, which tells you where to get a new one.
         </p>
       )}
       {!compact && (
         <>
           <p className="small muted">
-            <strong>Blobless clone</strong> (full history, blobs on demand — the developer shape): git does not match bundle
-            filters itself, so point it at the blobless bundle list explicitly. Keep <code>--sparse</code>: a full checkout
+            <strong>Blobless clone</strong> (full history, blobs on demand): keep <code>--sparse</code>: a full checkout
             would ask for every blob of HEAD's tree at once (minutes of server time); add areas with{" "}
             <code>git sparse-checkout add</code>.
           </p>
           <CodeSample code={r.blobless_clone} />
           <p className="small muted">
-            <strong>CI / shallow clones</strong> (<code>--depth</code>, <code>--single-branch</code>): pass{" "}
-            <code>-c transfer.bundleURI=false</code> — git otherwise downloads the full weekly bundle first (the whole
-            base pack of a large repository) even though the clone is bounded; upload-pack answers those in seconds.
+            <strong>CI / shallow clones</strong>: use <code>--depth=1 --single-branch</code>
+            when the job only needs the current branch tip.
           </p>
         </>
       )}

@@ -2,8 +2,6 @@ import { useCallback, useEffect, useRef, useState, type ReactNode } from "react"
 import { api, runOp, type OpEvent, type OpRecord, type Overview } from "../api";
 import { invalidate, useData } from "../data";
 import { Box } from "../components/Layout";
-import { BundlePlan } from "../components/BundlePlan";
-import { BundleChain } from "../components/BundleChain";
 import { useRepo } from "./RepoLayout";
 
 const fmtBytes = (n: number) => {
@@ -16,7 +14,6 @@ const fmtBytes = (n: number) => {
   return `${n.toFixed(i ? 1 : 0)} ${u[i]}`;
 };
 const fmtTime = (s?: string) => (s && !s.startsWith("1970") ? new Date(s).toLocaleString() : "—");
-const short = (s: string) => s.slice(0, 12);
 
 function KV({ rows }: { rows: [string, ReactNode][] }) {
   return (
@@ -102,8 +99,6 @@ export function OverviewPage() {
               ["sealed segments", m.segments.length],
               ["inline tail", m.tail_entries],
               ["last push", fmtTime(m.last_push)],
-              // oxlint-disable-next-line react/jsx-key
-              ["advertised bundle", m.advertised_bundle_uri ? <code className="wrap">{m.advertised_bundle_uri}</code> : "—"],
             ]}
           />
         </Box>
@@ -149,28 +144,10 @@ export function OverviewPage() {
                   ? `at_seq ${m.packset.at_seq}, ${m.packset.packs} pack(s), ${fmtBytes(m.packset.bytes)}, ${fmtTime(m.packset.created)} by ${m.packset.creator}`
                   : "—",
               ],
-              [
-                "bundle",
-                m.checkpoint ? (
-                  <>
-                    at_seq {m.checkpoint.at_seq}, {fmtBytes(m.checkpoint.size)}, <code>{short(m.checkpoint.sha)}</code>
-                  </>
-                ) : (
-                  "—"
-                ),
-              ],
             ]}
           />
         </Box>
       </div>
-
-      <Box title={`Bundle chain (${o.bundles.length} listed)`}>
-        <BundleChain bundles={o.bundles} />
-      </Box>
-
-      <Box title="Bundle slots (what the maintainer will cut next)">
-        <BundlePlan plan={o.bundle_plan} />
-      </Box>
 
       <Box title={`Compactions (${o.compactions.length})`}>
         {o.compactions.length === 0 ? (
@@ -228,7 +205,6 @@ function OpsBox({ repo, overview, onChanged }: { repo: string; overview: Overvie
   const [log, setLog] = useState<string[]>([]);
   const [status, setStatus] = useState<{ ok?: boolean; text: string } | null>(null);
   const [flags, setFlags] = useState<Record<string, boolean>>({});
-  const [strategy, setStrategy] = useState<string>("");
   const abort = useRef<AbortController | null>(null);
   const logRef = useRef<HTMLPreElement>(null);
 
@@ -285,8 +261,7 @@ function OpsBox({ repo, overview, onChanged }: { repo: string; overview: Overvie
 
   const paramsFor = (op: string, spec: { params: string[] }) => {
     const p: Record<string, string> = {};
-    for (const k of spec.params) if (k !== "strategy" && flags[`${op}.${k}`]) p[k] = "1";
-    if (op === "bundle" && strategy) p.strategy = strategy;
+    for (const k of spec.params) if (flags[`${op}.${k}`]) p[k] = "1";
     return p;
   };
 
@@ -294,7 +269,7 @@ function OpsBox({ repo, overview, onChanged }: { repo: string; overview: Overvie
     <Box title="Maintenance" id="ops">
       <div className="pad">
         <p className="small muted">
-          Every action runs on the instance that answers this request ({overview.hostname}) under the repo's GCS lease
+          Every action runs on the instance that answers this request ({overview.hostname}) under the repo's object-store lease
           where exclusivity matters, and publishes its result to the WAL like any other writer. Output streams below.
         </p>
         <table className="kv ops-table">
@@ -309,32 +284,16 @@ function OpsBox({ repo, overview, onChanged }: { repo: string; overview: Overvie
                 <td>
                   <div>{s.description}</div>
                   <div className="op-params">
-                    {s.params.flatMap((k) =>
-                      k === "strategy" ? [] : (
-                        <label key={k} className="small muted">
-                          <input
-                            type="checkbox"
-                            checked={!!flags[`${s.id}.${k}`]}
-                            onChange={(e) => setFlags({ ...flags, [`${s.id}.${k}`]: e.target.checked })}
-                          />{" "}
-                          {PARAM_HELP[k] ?? k}
-                        </label>
-                      ),
-                    )}
-                    {s.params.includes("strategy") && (
-                      <label className="small muted">
-                        strategy{" "}
-                        <select value={strategy} onChange={(e) => setStrategy(e.target.value)}>
-                          <option value="">default (first full)</option>
-                          <option value="due">due (per schedule)</option>
-                          {overview.ops.bundle_strategies.map((b) => (
-                            <option key={b} value={b}>
-                              {b}
-                            </option>
-                          ))}
-                        </select>
+                    {s.params.map((k) => (
+                      <label key={k} className="small muted">
+                        <input
+                          type="checkbox"
+                          checked={!!flags[`${s.id}.${k}`]}
+                          onChange={(e) => setFlags({ ...flags, [`${s.id}.${k}`]: e.target.checked })}
+                        />{" "}
+                        {PARAM_HELP[k] ?? k}
                       </label>
-                    )}
+                    ))}
                   </div>
                 </td>
               </tr>

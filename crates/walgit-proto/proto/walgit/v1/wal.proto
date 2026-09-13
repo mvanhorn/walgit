@@ -15,17 +15,20 @@ import "google/protobuf/timestamp.proto";
 //   wal/<sha>.pack|.idx    immutable, content-addressed (pack checksum)
 //                          (+ .rev, .bitmap for compacted packs)
 //   checkpoints/<seq:016x>/checkpoint.pb   Checkpoint: pack set + ref snapshot ref
-//   checkpoints/<seq:016x>/refs.pb         RefSnapshot
-//   checkpoints/<seq:016x>/<sha>.bundle    optional git bundle rendered from it
-//   bundles/list.pb        BundleList (bundle-uri advertisement)
+//   checkpoints/refs/<sha256>.pb          canonical RefSnapshot
+//   checkpoints/<seq:016x>/attempts/<id>/checkpoint.pb  unique metadata candidate
+//   Older checkpoints/<seq:016x>/refs.pb and bundle objects remain decodable;
+//   bundle wrappers/lists are historical data, not active runtime delivery.
 //   leases/<name>.pb       Lease (CAS + TTL)
 //   lfs/objects/aa/bb/<oid>
 //
-// Everything except manifest.pb, bundles/list.pb and leases/* is immutable.
+// Packs/snapshots/logs are immutable; manifests, leases and documented control
+// objects are mutable. Historical bundle formats below remain replayable.
 // ---------------------------------------------------------------------------
 
 message Manifest {
-  // Bumped only on incompatible layout changes. Readers reject unknown values.
+  // Format marker. New readers reject unknown values; deployed older readers
+  // do not enforce this gate and must be excluded during authority cutovers.
   uint32 format_version = 1;
   // "<owner>/<repo>"
   string repo = 2;
@@ -54,10 +57,12 @@ message Manifest {
   // refs-level sync must see the effective config without another GET; the
   // document is small (validated <= 16 KiB). History = SETTINGS log entries.
   RepoSettings settings = 12;
+  // Exact committed download history; no time or count expiry.
+  repeated RetiredPack retired_packs = 13;
 }
 
 // D24: per-repository settings — a TOML document restricted to the sections a
-// repository may override (`bundles`, `maintenance`, `compaction`); the
+// repository may override (maintenance, compaction, upstream, refs, packfile_uri); the
 // effective configuration is the host's walgit.toml with this merged on top
 // (`Config::with_settings`). Validated at publish; invalid settings are
 // never published.
@@ -109,19 +114,49 @@ message PackRef {
   // commits is stored at wal/<checksum>.commit-graph. Written for tier-2 bases
   // so readers walk history without pack data.
   bool has_commit_graph = 9;
-  // What the pack holds. OBJECTS (default) = a normal pack. HISTORY = a
-  // derived pack of the base's commits + trees (`pack-objects --filter=blob:none`),
-  // published next to a tier-2 base so instances keep every history walk local
-  // while blob data stays in the base (linked / remote). `derived_from` names
-  // the base pack; a history pack never supersedes anything and is superseded
-  // together with its base.
+  // OBJECTS is an ordinary unsegmented pack. HISTORY can be an old redundant
+  // accelerator derived from a live base, or authoritative non-blob segment
+  // content. BLOBS segments hold blobs. The enum alone does not establish
+  // ownership, retirement safety or URI eligibility. Preserve exact descriptors.
   PackKind kind = 10;
+  // Producer/base provenance; not permission to discard authoritative content.
   string derived_from = 11;
+  // Provenance only; never a substitute for exact group coverage.
+  uint64 covers_seq = 12;
+  google.protobuf.Timestamp published_at = 13;
+  PackAudience audience = 14;
+  string ref_policy = 15;
+  repeated string pack_groups = 16;
+  repeated PackGroupCoverage group_coverages = 17;
+  string coverage_refs_key = 18;
 }
 
 enum PackKind {
   PACK_KIND_OBJECTS = 0;
   PACK_KIND_HISTORY = 1;
+  PACK_KIND_BLOBS = 2;
+}
+
+// Scope classification only. These labels do not authorize access or prove closure.
+enum PackAudience {
+  PACK_AUDIENCE_UNSPECIFIED = 0;
+  PACK_AUDIENCE_CODE = 1;
+  PACK_AUDIENCE_META = 2;
+  PACK_AUDIENCE_RETAINED = 3;
+}
+
+message RetiredPack {
+  string checksum = 1;
+  google.protobuf.Timestamp retired_at = 2;
+  uint64 retired_seq = 3;
+}
+
+message PackGroupCoverage {
+  string group = 1;
+  string ref_policy = 2;
+  uint64 covers_seq = 3;
+  repeated string packs = 4;
+  string refs_key = 5;
 }
 
 enum EntryKind {
@@ -187,7 +222,7 @@ message Checkpoint {
   // Key of the `RefSnapshot`, e.g. "checkpoints/<seq>/refs.pb".
   string refs_key = 4;
   uint64 ref_count = 5;
-  // Optional rendered full bundle for bundle-uri, e.g. "checkpoints/<seq>/<sha>.bundle".
+  // Historical optional wrapper; retained for replay, new writers leave empty.
   string bundle_key = 6;
   google.protobuf.Timestamp created_at = 7;
   string writer = 8;
@@ -201,13 +236,14 @@ message CheckpointRef {
   // fetching the checkpoint object).
   google.protobuf.Timestamp created_at = 3;
   // Earliest WAL state this repository ever had (carried forward from the
-  // previous checkpoint, else the first folded entry's `created_at`: bundle
-  // slots before it are "unavailable"; slots after it are backfillable even
-  // on a maintainer that cold-starts from this checkpoint (D22).
+  // previous checkpoint, else the first folded entry's `created_at`).
+  // Historical provenance, retained independently of removed bundle schedules.
   google.protobuf.Timestamp first_state_at = 4;
   // `created_at` of the newest entry this checkpoint folded: the state it holds
   // is the repository "as of" this instant (≠ `created_at`, the write time).
   google.protobuf.Timestamp as_of = 5;
+  // Exact committed snapshot pointer, empty on old checkpoints.
+  string refs_key = 6;
 }
 
 message RefSnapshot {
@@ -241,7 +277,7 @@ message Lease {
 }
 
 // ---------------------------------------------------------------------------
-// bundle-uri: bundles/list.pb
+// Historical bundle-uri formats: retained for decoding; no active runtime
 // ---------------------------------------------------------------------------
 
 message BundleList {
@@ -331,7 +367,7 @@ message RepoCatalog {
 
 // Maintainer heartbeat at `maintain/<host>.pb` (bucket root, not per repo):
 // who maintains what, with what capacity, and whether that host is alive.
-// `bundle plan` / the WAL page show the responsible host per repository.
+// The WAL page shows the responsible host per repository.
 message MaintainerHeartbeat {
   string host = 1;
   repeated string repos = 2;

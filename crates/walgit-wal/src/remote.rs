@@ -10,7 +10,7 @@
 //! from GCS by range reads with a local block cache". It is used by the web
 //! API (`Need::Objects` on a too-large repo) which faults the objects a git
 //! command will touch into the local loose store and then runs the command
-//! unchanged; upload-pack does not use it (clones go through bundle-uri).
+//! unchanged. Remote fetch uses dynamic object traversal.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -18,7 +18,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use bytes::Bytes;
 use gix_pack::data::entry::Header;
 use tracing::Instrument;
-use walgit_proto::v1::{Manifest, PackRef};
+use walgit_proto::v1::Manifest;
 use walgit_store::{GetOptions, GetResult, ObjectStore, Prefixed};
 
 use crate::error::WalError;
@@ -158,118 +158,24 @@ impl RemotePacks {
         object_cache_bytes: u64,
         reporter: &Reporter,
     ) -> Result<Self, WalError> {
-        let dir = idx_dir(repo_dir);
-        tokio::fs::create_dir_all(&dir).await?;
-        // History packs are always local copies: no remote index for them.
+        let retained = &manifest.packs;
+        // Only redundant historical accelerators may be omitted. Authoritative
+        // history segments are the sole home of their objects on refs-only hosts.
         let manifest = {
             let mut m = manifest.clone();
-            m.packs
-                .retain(|p| p.kind != walgit_proto::v1::PackKind::History as i32);
+            m.packs.retain(|p| {
+                p.kind != walgit_proto::v1::PackKind::History as i32
+                    || !p.pack_groups.is_empty()
+                    || p.derived_from.is_empty()
+            });
             m
         };
         let manifest = &manifest;
-        let total_idx: u64 = manifest.packs.iter().map(|p| p.idx_size).sum();
-        let live: std::collections::HashSet<&str> =
-            manifest.packs.iter().map(|p| p.checksum.as_str()).collect();
-        // Drop indexes of packs no longer live (compaction superseded them).
-        if let Ok(mut rd) = tokio::fs::read_dir(&dir).await {
-            while let Ok(Some(e)) = rd.next_entry().await {
-                let name = e.file_name().to_string_lossy().to_string();
-                if let Some(stem) = name.strip_suffix(".idx")
-                    && !live.contains(stem)
-                {
-                    let _ = tokio::fs::remove_file(e.path()).await;
-                }
-            }
-        }
-        // An index the Serve level already installed (linked/local base) is
-        // the same bytes: hard-link it instead of downloading 2 GB twice onto
-        // the same tmpfs (and vice versa, see sync::link_and_install_pack).
-        for p in &manifest.packs {
-            let dest = dir.join(format!("{}.idx", p.checksum));
-            if dest.exists() {
-                continue;
-            }
-            let installed = repo_dir
-                .join("objects")
-                .join("pack")
-                .join(format!("pack-{}.idx", p.checksum));
-            if installed.is_file() && std::fs::hard_link(&installed, &dest).is_err() {
-                let _ = std::fs::copy(&installed, &dest);
-            }
-        }
-        let done = Arc::new(AtomicU64::new(0));
-        let missing: Vec<&PackRef> = manifest
-            .packs
-            .iter()
-            .filter(|p| !dir.join(format!("{}.idx", p.checksum)).exists())
-            .collect();
-        if !missing.is_empty() {
-            reporter.notice(format!(
-                "Pack set is {} across {} pack(s): too large for this instance's disk, reading objects straight from the WAL. Downloading {} pack index(es) ({}).",
-                human_bytes(manifest.packs.iter().map(|p| p.pack_size).sum()),
-                manifest.packs.len(),
-                missing.len(),
-                human_bytes(missing.iter().map(|p| p.idx_size).sum()),
-            ));
-            let throttle = Arc::new(crate::progress::Throttle::new(
-                std::time::Duration::from_millis(250),
-            ));
-            let sem = Arc::new(tokio::sync::Semaphore::new(4));
-            let mut tasks = Vec::new();
-            for p in missing {
-                let sem = sem.clone();
-                let store = store.clone();
-                let dir = dir.clone();
-                let p = p.clone();
-                let done = done.clone();
-                let reporter = reporter.clone();
-                let throttle = throttle.clone();
-                tasks.push(tokio::spawn(async move {
-                    let _permit = sem
-                        .acquire()
-                        .await
-                        .map_err(|e| WalError::Corrupt(e.to_string()))?;
-                    let tmp = dir.join(format!("{}.idx.tmp", p.checksum));
-                    let dest = dir.join(format!("{}.idx", p.checksum));
-                    let cb = |delta: u64, _t: u64| {
-                        let all = done.fetch_add(delta, Ordering::Relaxed) + delta;
-                        if throttle.tick(false) {
-                            reporter.bar("Downloading pack indexes", all, Some(total_idx), "bytes");
-                        }
-                    };
-                    crate::sync::download_object(
-                        &store,
-                        &walgit_proto::keys::idx_key(&p.checksum),
-                        &tmp,
-                        (p.idx_size > 0).then_some(p.idx_size),
-                        Some(&cb),
-                    )
-                    .await?;
-                    tokio::fs::rename(&tmp, &dest).await?;
-                    Ok::<(), WalError>(())
-                }));
-            }
-            for t in tasks {
-                t.await.map_err(|e| WalError::Corrupt(e.to_string()))??;
-            }
-            reporter.bar(
-                "Downloading pack indexes",
-                total_idx,
-                Some(total_idx),
-                "bytes",
-            );
-        }
-        let mut packs = Vec::with_capacity(manifest.packs.len());
-        for p in &manifest.packs {
-            let path = dir.join(format!("{}.idx", p.checksum));
-            let idx = tokio::task::spawn_blocking({
-                let path = path.clone();
-                move || gix_pack::index::File::at(&path, hash)
-            })
-            .await
-            .map_err(|e| WalError::Corrupt(e.to_string()))?
-            .map_err(|e| WalError::Corrupt(format!("open pack index {}: {e}", path.display())))?;
+        let loaded =
+            crate::index_cache::load(&store, repo_dir, &manifest.packs, retained, hash, reporter)
+                .await?;
+        let mut packs = Vec::with_capacity(loaded.len());
+        for (p, idx) in loaded {
             let key = walgit_proto::keys::pack_key(&p.checksum);
             let size = if p.pack_size > 0 {
                 p.pack_size

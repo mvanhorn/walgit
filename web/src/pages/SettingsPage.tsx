@@ -64,72 +64,11 @@ function Tasks({ d, o, full }: { d: SettingsDescribe; o: Overview; full: string 
   const host = d.maintenance.this_host;
   return (
     <>
-      <Box title={`Bundle strategies (${d.strategies.length}) — ${d.bundles.enabled ? "enabled" : "disabled"}`}>
-        {d.strategies.length === 0 ? (
-          <div className="muted pad">No strategies in the effective config.</div>
-        ) : (
-          <div className="scroll-x">
-            <table className="grid">
-              <thead>
-                <tr>
-                  <th>name</th>
-                  <th>kind</th>
-                  <th>base</th>
-                  <th>schedule</th>
-                  <th>next (local time)</th>
-                  <th>keep</th>
-                  <th>backfill</th>
-                  <th>min commits</th>
-                  <th>refs</th>
-                </tr>
-              </thead>
-              <tbody>
-                {d.strategies.map((s) => (
-                  <tr key={s.name}>
-                    <td>
-                      <strong>{s.name}</strong>
-                    </td>
-                    <td>
-                      <span className={`pill ${s.kind}`}>{s.kind}</span>
-                    </td>
-                    <td>{s.base ?? "—"}</td>
-                    <td>
-                      <code>{s.schedule}</code>
-                      <div className="muted small">{s.schedule_human}</div>
-                    </td>
-                    <td>{fmtTime(s.next)}</td>
-                    <td>
-                      {s.kind === "full" ? (
-                        s.keep
-                      ) : s.chain ? (
-                        <span title="chained: each slot is cut on this strategy's previous bundle; every link since the newest kept base stays listed">
-                          chain since {s.base}
-                        </span>
-                      ) : (
-                        <span className="muted" title="cut on the base's newest bundle; the 2 newest are listed (D21)">2 newest</span>
-                      )}
-                    </td>
-                    <td>{s.backfill_max || "∞"}</td>
-                    <td>{s.kind === "full" ? <span className="muted">never gated</span> : s.min_commits}</td>
-                    <td className="small">{s.refs.join(", ")}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        )}
-        <div className="pad small muted">
-          Calendar slots, backfilled oldest-first; content = WAL state as of the slot; creationToken = slot epoch. Fulls are never gated by
-          min_commits; an incremental below the floor is <span className="pill too-small">too-small</span> and the next slot catches up.
-          Refs {d.bundles.main_only ? "main-only" : "all"} for this repository.
-        </div>
-      </Box>
-
       <Box title="Maintenance placement (host facts, read-only)">
         <KV
           rows={[
             ["checkpoints", d.maintenance.checkpoints ? `on · every ${d.maintenance.interval_secs}s pass` : "off"],
-            ["compaction", d.compaction.enabled ? `on · trigger ${d.compaction.trigger_packs} packs / ${fmtBytes(d.compaction.trigger_bytes)}` : "off"],
+            ["pack maintenance", d.packs.enabled ? `on · fold threshold ${d.packs.fold_when_fresh_packs_reach} packs · segment target ${fmtBytes(d.packs.segment_max_bytes)}` : "off"],
             [
               "this instance",
               <span key="this-instance">
@@ -139,13 +78,13 @@ function Tasks({ d, o, full }: { d: SettingsDescribe; o: Overview; full: string 
             ],
             ["capacity here", `${host.disk} · pack cap ${fmtBytes(host.max_pack_bytes || host.cache_budget_bytes)} · cache budget ${fmtBytes(host.cache_budget_bytes)}`],
             ["upstream follow", <UpstreamFollow key="upstream-follow" u={d.upstream} />],
-            ["maintainers", <Maintainers key="maintainers" list={o.bundle_plan.maintainers} orphaned={o.bundle_plan.orphaned} label={false} />],
+            ["maintainers", <Maintainers key="maintainers" list={o.maintenance.maintainers} orphaned={o.maintenance.orphaned} label={false} />],
           ]}
         />
         <div className="pad small muted">
           Who maintains a repository is a host rule (<code>[placement] maintain / maintain_exclude</code> + declared capacity), not a repository
-          setting. What those hosts will cut next, and the chain they have published, is on the <Link to={`/${full}/wal`}>WAL page</Link>; change
-          strategies, min_commits or compaction triggers for <code>{full}</code> under “Effective config & history”.
+          setting. Their recent maintenance work is on the <Link to={`/${full}/wal`}>WAL page</Link>; change
+          checkpoint settings or pack maintenance for <code>{full}</code> under “Effective config & history”.
         </div>
       </Box>
     </>
@@ -412,7 +351,7 @@ function EffectiveConfig({ d, full }: { d: SettingsDescribe; full: string }) {
             spellCheck={false}
             rows={Math.min(24, Math.max(8, text.split("\n").length + 1))}
             value={text}
-            placeholder={"# TOML overrides of [bundles], [maintenance], [compaction], [upstream]\n[bundles]\nmin_commits = 25\n"}
+            placeholder={"# TOML overrides of [refs], [packfile_uri], [maintenance], [packs], [upstream]\n[packs]\nfold_when_fresh_packs_reach = 25\n"}
             onChange={(e) => {
               setText(e.target.value);
               setDirty(true);

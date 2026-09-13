@@ -61,10 +61,10 @@ lane segment (e.g. `/{owner}/{repo}/api2/…`) without infrastructure work.
 | Page routes | Every UI route below MUST return `web/dist/index.html` (`text/html; charset=utf-8`, `Cache-Control: no-cache`) so deep links and reloads work: `/`, `/{owner}`, `/{owner}/{repo}`, `/{owner}/{repo}/tree/*`, `/{owner}/{repo}/blob/*`, `/{owner}/{repo}/commits`, `/{owner}/{repo}/commits/*`, `/{owner}/{repo}/commit/*`, `/{owner}/{repo}/wal`, `/{owner}/{repo}/settings`, and `/api` (the "API" docs page in the UI; `?repo=owner/name` pre-fills its examples; `/api/v1` itself is the JSON discovery document). |
 | API base | **`/{owner}/{repo}/api`** (bearer / same-origin cookie) and **`/{owner}/{repo}/api-browser`** (cross-origin browser), D15/D26/D27: one path prefix per repository, so the edge routes e.g. `acme/monorepo` to its host. Non-repo: `/api/v1` (discovery, `me`, `authenticate`, `owners`), `/services/api/owners*`, `/services/api/instance`. The bundled UI fetches same-origin with the session cookie and `Accept: application/json, text/event-stream`. No aliases or application sessions. |
 | Public lane | **`/services/public/*`** — the one open prefix besides health and the SDK (nginx skips `auth_request` there; the app never authenticates here and never reads repo data). Today exactly `/services/public/install.sh[?repo=owner/name]` (`text/x-shellscript`, `Cache-Control: public, max-age=300`); plus `/services/public/ca.pem` (the certificate this process presents when it terminates TLS itself, `application/x-pem-file`, D39; 404 behind an edge); anything else under it is 404. |
-| Setup | `/services/setup.json[?repo=owner/name]` — the clone/setup recipes (`setup::Recipes`: `token_url`, `install`, `install_url`, `plain_clone`, `blobless_clone`, `bundle_list`, `manual_clone`, `setup_text`, and `ca_url` + `trust` when the host terminates self-signed TLS itself — D39), `no-cache`; `/services/public/install.sh[?repo=]` — the one-time installer (open lane, AGENTS §1.3) (POSIX sh). The Clone menu and the API page render these, never their own copies. |
+| Setup | `/services/setup.json[?repo=owner/name]` — the clone/setup recipes (`setup::Recipes`: `token_url`, `install`, `install_url`, `plain_clone`, `blobless_clone`, `manual_clone`, `setup_text`, and `ca_url` + `trust` when the host terminates self-signed TLS itself — D39), `no-cache`; `/services/public/install.sh[?repo=]` — the one-time installer (open lane, AGENTS §1.3) (POSIX sh). The Clone menu and the API page render these, never their own copies. |
 | Auth | `/_auth/login?next=`, `/_auth/callback`, `/_auth/logout`, `/_auth/me`, `/_auth/check` (an `auth_request` target for an edge), `/_auth/tokens` (GET: the token page; POST: mint a walgit access token for the signed-in principal, `{token, principal, write, expires_at}`, same-origin only) — in-app OIDC sign-in + session cookie. Off until `session_secret` + the OAuth client are set. |
 | SDK | `/repos.js` (IIFE, registers `window.repos`) and `/repos.mjs` (ESM), built from `web/sdk/repos.ts` into `web/dist/` by `pnpm run build`; `no-cache` + strong ETag, precompressed. These data-free routes are open at the application. |
-| Dev | `vite dev` proxies `/api/`, `/api-browser/`, `/services/api/` and `/{owner}/{repo}/api[-browser]/…` (plus git/bundle paths) to `$WALGIT_URL` (default `http://127.0.0.1:8080`). |
+| Dev | `vite dev` proxies `/api/`, `/api-browser/`, `/services/api/` and `/{owner}/{repo}/api[-browser]/…` (plus git paths) to `$WALGIT_URL` (default `http://127.0.0.1:8080`). |
 
 Path segments in URLs are `encodeURIComponent`-encoded per segment by the
 client (`enc()` in `api.ts`); `/` between segments is literal. Servers must
@@ -192,7 +192,7 @@ Anything long-running is a **task** with a unique id, discoverable per repo:
 `TaskRecord`: `{id, kind, repo, hostname, started, finished?, elapsed_ms,
 ok?: bool, summary, progress?: {label,done,total?,unit,percent?},
 log_tail: [string], params?: {…}}`; `ok` absent = running. Kinds today:
-`materialize`, `remote-index`, `fsck`, `compact`, `bundle`, `checkpoint`,
+`materialize`, `remote-index`, `fsck`, `compact`, `checkpoint`,
 `sync`, `rematerialize`.
 
 ## 3. Ref + path resolution (`{rest...}` routes)
@@ -265,12 +265,12 @@ removes it (admin permission) — the same handlers as `PUT|DELETE /{owner}/{rep
 `GET|PUT|DELETE …/policy` is the push policy document (`docs/POLICY.md`).
 
 `GET|PUT|DELETE /{o}/{r}/api/settings` (D24, 2026-08-21) is the repository's **settings in the WAL**: a TOML document
-restricted to `[bundles]`, `[maintenance]`, `[compaction]` and `[upstream]`, merged over the
+restricted to `[refs]`, `[packfile_uri]`, `[maintenance]`, `[packs]` and `[upstream]`, merged over the
 host's config (`effective config`).
 `GET` → `{revision, author, updated_at, message, toml}` (`revision: 0` = none). `PUT` body = the TOML
 (`?message=` optional), validated against the serving host's build — 400 with the reason and nothing published
 on failure; 200 `{revision}`. `DELETE` publishes an empty document. `GET …/settings/effective` → the effective
-`[bundles]`/`[maintenance]`/`[compaction]`/`[upstream]` as TOML (`application/toml`; no host secrets,
+allowed sections as TOML (`application/toml`; no host secrets,
 no `token_env`); `GET …/settings/history` → `{min_seq, entries:[{seq,revision,author,message,
 at,toml}]}` from the live log (older changes are folded into checkpoints). All `no-store`; PUT/DELETE need
 **admin** (`tokens[].admin` or oidc `admin_emails`/`admin_domains`; `mode = none` is admin on loopback).
@@ -278,8 +278,8 @@ Every instance sees a new revision on its next refs-level sync (no extra round t
 inline on `manifest.pb`). CLI: `walgit repo settings show|set|clear|history`.
 
 Settings tab helpers (`/{o}/{r}/api/settings…`, all `no-store`): `GET …/settings/describe` → `{settings, sections,
-strategies:[{name,kind,base,schedule,schedule_human,next,keep,backfill_max,min_commits,refs}], bundles, maintenance:
-{checkpoints,interval_secs,this_host:{name,serves,maintains,disk,max_pack_bytes,cache_budget_bytes,roles}}, compaction,
+maintenance:
+{checkpoints,interval_secs,this_host:{name,serves,maintains,disk,max_pack_bytes,cache_budget_bytes,roles}}, packs{enabled,fold_when_fresh_packs_reach,fold_when_max_age_secs,segment_max_bytes,freeze_when_settled_secs},
 upstream:{git,lfs,token_env:bool,follow:[refs],follow_interval_secs,last_round:{at,outcome: in-sync|published|refused|failed,
 detail,upstream:{ref:oid},ours:{ref:oid}}|null} (D33; last_round = this instance's last follow round),
 fields:[{key,value,host_value,source: host|setting}], head_seq}`; `POST …/settings/validate` (body TOML) → the same
@@ -468,13 +468,10 @@ WAL should return `404` (the tab then shows the error text). Shape is in
 `health{status: ok|degraded|error, issues[], deep, suggestions[{op, params?, reason, auto?}]}` — `deep` is the
 last connectivity audit as recorded in the store (`fsck.pb`, any maintainer), `auto` says how/when the
 maintainer loop performs a suggestion by itself (absent = a human must) — `manifest{version,
-next_seq, min_seq, segments[], tail_entries, entries, checkpoint?,
-packset?, advertised_bundle_uri?, last_push?}`, `local{version, next_seq,
+next_seq, min_seq, segments[], tail_entries, entries,
+packset?, last_push?}`, `local{version, next_seq,
 bootstrap, reconciled, size_bytes}`, `packs{live, live_bytes, pushes}`,
-`bundles[{sha, size, at_seq, created, uri, strategy, kind, base_id, creation_token, filter, tips}]` (the chain:
-`base_id` is the bundle whose tips are this one's prerequisites, `""` for a full), `bundle_plan{slots[{strategy,
-kind, slot, status: built|missing|pending|blocked|unavailable|too-small|skipped|wrong-host, detail, bundle_id}],
-upcoming[], maintainers[{host, disk, max_pack_bytes, last_pass_age_secs, alive, passes, last_unit}], orphaned}`,
+`maintenance{maintainers[{host, disk, max_pack_bytes, last_pass_age_secs, alive, passes, last_unit}], orphaned}`,
 `compactions[]`, `node{…counters}`. Arrays `[]` when empty.
 
 ### Service routes (not for the browser)

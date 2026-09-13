@@ -560,8 +560,7 @@ document.getElementById('mint').onclick = async () => {
     `git config --global credential.https://${host}.helper store
 ` +
     `printf 'protocol=https\nhost=${host}\nusername=${j.principal}\npassword=${j.token}\n' | git credential approve
-` +
-    `git config --global transfer.bundleURI true`;
+`;
   document.getElementById('out').hidden = false;
   document.getElementById('mint').disabled = true;
 };

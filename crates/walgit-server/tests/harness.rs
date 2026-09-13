@@ -21,7 +21,6 @@ pub struct Server {
     _shutdown: tokio::sync::oneshot::Sender<()>,
     pub store: Arc<MemoryStore>,
     registry: Arc<walgit_wal::Registry>,
-    bundles: Arc<walgit_bundle::Bundler>,
     /// The instance's state (maintenance loop tests drive `run_pass` directly).
     pub state: Arc<walgit_server::AppState>,
     /// Cache dir; removed when the server is dropped (hermetic, no /tmp pile-up).
@@ -84,8 +83,6 @@ impl Server {
         cfg.wal.check_connectivity = true;
         cfg.wal.freshness_ttl = std::time::Duration::ZERO;
         cfg.git.allow_filter = true;
-        cfg.bundles.advertise = true;
-        cfg.bundles.min_commits = 0; // tests cut tiny incrementals on purpose; the gate has its own test
 
         // Allow the e2e suite to run under either upload-pack engine.
         // Default: git (the subprocess engine). Set =gix to use the
@@ -116,7 +113,6 @@ impl Server {
         let state = AppState::new(Arc::new(cfg), dyn_store).await?;
 
         let registry = state.registry.clone();
-        let bundles = state.bundles.clone();
         // Events bridge sweep timer (no-op unless the bridge is enabled).
         walgit_server::bridge::spawn_sweeper(state.clone());
 
@@ -139,7 +135,6 @@ impl Server {
             _shutdown: tx,
             store,
             registry,
-            bundles,
             state,
             _cache: cache,
         })
@@ -207,12 +202,6 @@ impl Server {
             Ok(h) => h.packs_ready() && !h.local().packs().map_or(true, |p| p.is_empty()),
             Err(_) => false,
         }
-    }
-
-    pub async fn build_bundle(&self, owner: &str, repo: &str, strategy: &str) -> Result<()> {
-        let id = walgit_git::RepoId::new(owner, repo)?;
-        self.bundles.build(&id, strategy).await?;
-        Ok(())
     }
 
     pub async fn ls_remote(&self, owner: &str, repo: &str) -> Result<String> {

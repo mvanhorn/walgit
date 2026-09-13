@@ -23,11 +23,12 @@ anyone can run against a bucket, and predictable enough that tooling can build o
 3. **Fast for the monorepo, from machines smaller than it.** A repository of tens of gigabytes, tens of
    millions of objects and hundreds of thousands of refs must be *fast* from a host with a few GiB of tmpfs:
    refs in < 1 s cold, web pages in ~100 ms, CI's `clone --filter=blob:none --depth=1 --sparse --single-branch`
-   in seconds, a developer's `git fetch` in the time it takes to read the output, fresh clones as static
-   bundles (weekly full + daily/hourly chain) so bytes move bucket → laptop and never through a server.
-   **Fast clone + fast catch-up through bundles is the north star** (`docs/BUNDLE_URI_DESIGN.md`).
+   in seconds, a developer's `git fetch` in the time it takes to read the output, fresh clones and stale fetches using negotiated reusable packs so bulk bytes can move directly to clients.
+   **Fast clone and catch-up through proved static packs is the north star**
+   ([design and current scope](docs/PACKFILE_URI_DESIGN.md)). Native anonymous-read delivery is implemented;
+   protected-client qualification and scale acceptance remain to be established and measured.
 4. **All the features a git host needs, and only those**: smart HTTP v0/v2 (ls-refs, fetch with
-   filter/shallow/deepen, receive-pack atomic/delete/tags/push-options/report-status-v2), bundle-uri, LFS,
+   filter/shallow/deepen, receive-pack atomic/delete/tags/push-options/report-status-v2), negotiated packfile delivery, LFS,
    `<owner>/<repo>` namespaces, per-repo push policy and settings, ref events, a browsing web UI + one JSON API +
    one SDK (`repos.js`), tasks/narration so nothing ever waits silently. Not in scope: code review, merge
    queues, CI, issues — those live elsewhere and build on this.
@@ -35,9 +36,9 @@ anyone can run against a bucket, and predictable enough that tooling can build o
    provider, a token for git), one install script, `git` does the rest; errors tell you the fix; every long
    wait is narrated. The developer on a rebased branch must get *cheaper*, never slower.
 6. **Predictable for the systems that build on it**: stable, immutable, cacheable, CDN-able artefacts
-   (bundles, packs, sha-addressed API answers); O(1) ref lookups; latency that does not depend on which
+   (packs, sha-addressed API answers); O(1) ref lookups; latency that does not depend on which
    instance you hit or how many refs exist; a provenance log you can rewind (`walgit wal materialize --at-seq`).
-7. **Use the tools; don't reinvent them.** Upstream `git` where it is right (repack, bitmaps, bundle create,
+7. **Use the tools; don't reinvent them.** Upstream `git` where it is right (repack, bitmaps,
    upload-pack), `gix` where it is faster and measured, Rust + tokio + axum for the server, the object store
    as it is (range reads, compose / multipart copy, CAS), a plain nginx or CDN in front of static bytes,
    content addressing everywhere, the WAL's ergonomics (`walgit wal ls|show|materialize`) as a first-class
@@ -50,8 +51,8 @@ anyone can run against a bucket, and predictable enough that tooling can build o
 |---|---|
 | Cold instance is useful in seconds | `ls-remote` of the largest repository < 1 s on a fresh instance, even while it installs that repository's packs |
 | CI clone of the monorepo | `clone --filter=blob:none --depth=1 --sparse --single-branch` in seconds, not minutes (reference: 2075 s → 8 s on a 57 GiB / 73 M-object repository) |
-| Developer catch-up | a days-stale `fetch` on main = exactly the bundle slots missed + < 1 h of objects from upload-pack |
-| Fresh clone of the monorepo | bytes through the server ≈ one hour of pushes; the rest is static bundles (reference: 32.7 GB static, 2.8 MB through upload-pack) |
+| Developer catch-up (target) | a stale `fetch` negotiates useful proven packs plus its uncovered requested graph; small fetches stay dynamic |
+| Fresh clone of the monorepo (target) | reusable packs carry the proven baseline; validate URI packs + dynamic remainder against ordinary Git and measure both server and client cost |
 | Web UI on the monorepo | tree/blob/commits without packs on disk, ~100–200 ms warm |
 | Push | acknowledged only after the bucket ACKs; one CAS per batch; the host that maintains a repository writes it |
 | Consistency | push then fetch anywhere sees it; concurrent pushers: exactly one winner (the simulation suite) |
@@ -61,5 +62,5 @@ anyone can run against a bucket, and predictable enough that tooling can build o
 ## What we deliberately do **not** optimise for
 
 - Millions of tiny repositories (the long tail is served, not tuned for).
-- Running a 30 GB base repack on a tmpfs host (that is a job for the host with the SSD, weekly).
+- Running a 30 GB base repack on a tmpfs host (that is a job for the host with sufficient disk).
 - Forking git or inventing an object format: weird stuff happens *around* git, never inside it.

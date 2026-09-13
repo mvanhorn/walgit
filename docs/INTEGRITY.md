@@ -56,8 +56,7 @@ finishes without redoing finished work; running it again on a completed import c
 - **Marker** `<pack dir>/../walgit-import/<owner>-<repo>.json`, keyed by the *intent* (repository + a hash of the
   exact ref set being published — a different `--refs` filter is a different import): the target manifest version
   when the import started, the seq it publishes at, the last completed phase (`started → verified → side-files →
-  history-pack → uploaded → bundled`), the **per-object done set** of uploaded store keys, the history pack path,
-  the composed bundle entry. Written after every phase and after every uploaded object (a kill loses at most one
+  history-pack → uploaded`), the **per-object done set** of uploaded store keys, the history pack path. Written after every phase and after every uploaded object (a kill loses at most one
   object's upload).
 - **Resume rule**: the marker is used only while the target's manifest version is still the one recorded; if the
   repository moved meanwhile (someone pushed or imported) the run refuses with the fix — `--force` starts over on the

@@ -30,7 +30,7 @@ export type {
   Me,
 } from "../sdk/repos";
 import type { RefInfo, OpEvent, OpSpec, OpRecord, Tasks } from "../sdk/repos";
-export type { SettingsDescribe, SettingsValidation, SettingsHistory, StrategyInfo, SettingsField, Policy, PolicyValidation, PolicyDryRun, RepoSettings } from "../sdk/repos";
+export type { SettingsDescribe, SettingsValidation, SettingsHistory, SettingsField, Policy, PolicyValidation, PolicyDryRun, RepoSettings } from "../sdk/repos";
 
 /** Kept for callers: the SDK's error class under the UI's historical name. */
 export const ApiError = ReposError;
@@ -127,32 +127,14 @@ export interface SetupRecipes {
   install_url: string;
   manual_clone: string;
   plain_clone: string;
-  /** Blobless + sparse from the blobless bundle family, fetches on it too (`fetch.bundleURI`). */
+  /** Blobless + sparse: full history with blobs fetched on demand. */
   blobless_clone: string;
-  /** The repository's unfiltered bundle list URL. */
-  bundle_list: string;
   setup_text: string;
   /** Self-signed TLS: the CA to pin and the one-liner that does it (null behind a public certificate). */
   ca_url: string | null;
   trust: string | null;
 }
 
-export interface BundleInfo {
-  sha: string;
-  size: number;
-  at_seq: number;
-  created: string;
-  creator: string;
-  uri: string;
-  /** Chain facts (empty on the checkpoint bundle). */
-  strategy: string;
-  kind: string;
-  /** The bundle whose tips are this one's prerequisites ("" for a full). */
-  base_id: string;
-  creation_token: number;
-  filter: string;
-  tips: [string, string][];
-}
 export interface Overview {
   repo: string;
   instance: { kind: string; name: string; revision: string; instance: string; version: string; roles: string[]; disk: string; shape: string; cpus: number; memory_bytes: number };
@@ -165,7 +147,7 @@ export interface Overview {
     deep: string;
     suggestions: { op: string; params?: string; reason: string; auto?: string }[];
   };
-  ops: { available: OpSpec[]; recent: OpRecord[]; bundle_strategies: string[] };
+  ops: { available: OpSpec[]; recent: OpRecord[] };
   /** `sh -c "$(curl -fsSL …/services/public/install.sh)"` (open route; stdin stays the terminal for the token prompt). */
   install: string;
   /** Absolute URL of the installer. */
@@ -178,17 +160,12 @@ export interface Overview {
     segments: { key: string; first_seq: number; last_seq: number; size: number }[];
     tail_entries: number;
     entries: number;
-    checkpoint?: BundleInfo;
     packset?: { at_seq: number; packs: number; bytes: number; created: string; creator: string };
-    advertised_bundle_uri?: string;
     last_push?: string;
   };
   local: { version: string; next_seq: number; bootstrap: number; reconciled: boolean; size_bytes: number };
   packs: { live: number; live_bytes: number; pushes: number };
-  bundles: BundleInfo[];
-  bundle_plan: {
-    slots: { strategy: string; kind: string; slot: number; status: "built" | "missing" | "pending" | "blocked" | "unavailable" | "too-small" | "skipped" | "wrong-host"; detail: string; bundle_id: string | null }[];
-    upcoming: { strategy: string; kind: string; slot: number; unit: string; host: string | null }[];
+  maintenance: {
     maintainers: { host: string; disk: string; max_pack_bytes: number; last_pass_age_secs: number | null; alive: boolean; passes: number; last_unit: string }[];
     orphaned: boolean;
   };

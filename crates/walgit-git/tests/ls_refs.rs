@@ -206,7 +206,7 @@ fn bench_ls_refs_466k() {
     let ls_elapsed = start.elapsed();
     let mut advert = Vec::new();
     let start = Instant::now();
-    repo.advertise_refs_v0(walgit_git::Service::UploadPack, &mut advert)
+    repo.advertise_refs_v0(walgit_git::Service::UploadPack, &mut advert, None)
         .unwrap();
     let advert_elapsed = start.elapsed();
     let rss_kib = std::fs::read_to_string("/proc/self/status")

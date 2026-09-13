@@ -1,6 +1,6 @@
 import type { Overview } from "../api";
 
-type M = Overview["bundle_plan"]["maintainers"][number];
+type M = Overview["maintenance"]["maintainers"][number];
 
 /** Alive within 10 min (the heartbeat is one per pass, a pass is ≤ 60 s). */
 const ALIVE_SECS = 600;
@@ -35,7 +35,7 @@ export function Maintainers({ list, orphaned, label = true }: { list: M[]; orpha
     <div className="maintainers small">
       {orphaned && (
         <div className="flash error" role="alert">
-          Nobody maintains this repository right now: no maintainer has passed in the last {ALIVE_SECS / 60} minutes. Checkpoints, bundles and
+          Nobody maintains this repository right now: no maintainer has passed in the last {ALIVE_SECS / 60} minutes. Checkpoints and
           compaction wait until one is back.
         </div>
       )}

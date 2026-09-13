@@ -61,14 +61,10 @@ pub struct Recipes {
     pub install_url: String,
     /// One-shot clone with a token in the environment, no helper.
     pub manual_clone: String,
-    /// Plain clone once the helper is installed (still carries `-c fetch.bundleURI=<list>`: git records
-    /// no list URI for an *advertised* bundle-uri clone, and without one every later `git fetch`
-    /// skips bundles — fast catch-up through them is the point).
+    /// Plain clone once the helper is installed.
     pub plain_clone: String,
-    /// The developer shape for big repositories: blobless, sparse, from the blobless bundle family.
+    /// The developer shape for big repositories: blobless and sparse.
     pub blobless_clone: String,
-    /// The unfiltered bundle list of the repository (what `--bundle-uri` points at).
-    pub bundle_list: String,
     /// Multi-line setup text (auth errors, overview `setup` field).
     pub setup_text: String,
     /// Self-signed TLS: where this host's certificate is published, and the one-time
@@ -118,23 +114,13 @@ pub fn recipes(cfg: &Config, base_url: &str, repo: Option<&str>) -> Recipes {
         Some(r) => format!("{base_url}/{r}.git"),
         None => format!("{base_url}/<owner>/<repo>.git"),
     };
-    // `fetch.bundleURI` on every clone: `git clone -c k=v` persists into the new repository's config,
-    // and `git fetch` consults bundles only through that key.
-    let bundle_list = format!("{url}/bundles/list");
-    // Fetches record the catch-up list (incrementals only): a client with history never needs a
-    // full, and git downloads any full newer than its token.
-    let catchup = format!("{url}/bundles/catchup");
     let manual_clone = if needs_token(cfg) {
-        format!(
-            "git -c http.extraHeader=\"Authorization: Bearer $WALGIT_TOKEN\" -c transfer.bundleURI=true -c fetch.bundleURI={catchup} clone {url}"
-        )
+        format!("git -c http.extraHeader=\"Authorization: Bearer $WALGIT_TOKEN\" clone {url}")
     } else {
-        format!("git -c transfer.bundleURI=true -c fetch.bundleURI={catchup} clone {url}")
+        format!("git clone {url}")
     };
-    let plain_clone = format!("git clone -c fetch.bundleURI={catchup} {url}");
-    let blobless_clone = format!(
-        "git clone --filter=blob:none --sparse --bundle-uri={bundle_list}?filter=blob:none -c fetch.bundleURI={catchup}?filter=blob:none {url}"
-    );
+    let plain_clone = format!("git clone {url}");
+    let blobless_clone = format!("git clone --filter=blob:none --sparse {url}");
     let trust_text = match &trust {
         Some(_) => format!(
             "# {host} presents a self-signed certificate: the installer pins it for git; browsers accept it once.\n"
@@ -148,14 +134,14 @@ pub fn recipes(cfg: &Config, base_url: &str, repo: Option<&str>) -> Recipes {
     };
     let setup_text = match repo {
         Some(_) => format!(
-            "{trust_text}{where_from}# Run once per machine (installs the git credential helper, enables bundle URIs and clones; safe to re-run):\n\
+            "{trust_text}{where_from}# Run once per machine (installs the git credential helper and clones; safe to re-run):\n\
              {install}\n\
              \n\
              # Already set up? {plain_clone}\n\
              # One-shot (CI): {manual_clone}\n"
         ),
         None => format!(
-            "{trust_text}{where_from}# Run once per machine (installs the git credential helper and enables bundle URIs; safe to re-run):\n\
+            "{trust_text}{where_from}# Run once per machine (installs the git credential helper; safe to re-run):\n\
              {install}\n\
              {plain_clone}\n\
              \n\
@@ -171,7 +157,6 @@ pub fn recipes(cfg: &Config, base_url: &str, repo: Option<&str>) -> Recipes {
         manual_clone,
         plain_clone,
         blobless_clone,
-        bundle_list,
         setup_text,
         ca_url,
         trust,
@@ -233,8 +218,8 @@ esac
 /// git ≥ 2.46 + curl → (self-signed: pin `/services/public/ca.pem`) → the credential helper → a token
 /// (`$WALGIT_TOKEN`, an already stored one, or asked for on the terminal; no terminal: exit 2 with the
 /// two things to do) → git config for the host (`credential.<host>.helper` = exactly ours,
-/// `transfer.bundleURI true`, `fetch.uriProtocols https`, stale `fetch.bundleURI`/`extraHeader` removed)
-/// → self-test (`/api/v1/me`, or `git ls-remote` of `repo`) → with `repo`, `git clone -c fetch.bundleURI=… `.
+/// stale `extraHeader` removed)
+/// → self-test (`/api/v1/me`, or `git ls-remote` of `repo`) → with `repo`, `git clone`.
 pub fn install_script(cfg: &Config, base_url: &str, repo: Option<&str>) -> String {
     let r = recipes(cfg, base_url, repo);
     let host = &r.host;
@@ -308,7 +293,7 @@ pub fn install_script(cfg: &Config, base_url: &str, repo: Option<&str>) -> Strin
     };
     let tail = match repo {
         Some(_) => format!(
-            "echo \"$HOST: ready — cloning (history from static bundles, fetches stay on them)\"\n\
+            "echo \"$HOST: ready — cloning\"\n\
              exec {plain}\n",
             plain = r.plain_clone,
         ),
@@ -339,7 +324,7 @@ pub fn install_script(cfg: &Config, base_url: &str, repo: Option<&str>) -> Strin
         r#"#!/bin/sh
 # {host} — git setup in one command, idempotent (re-run any time; each step converges):
 #   stores an access token for https://{host} in a file only you can read, installs a git
-#   credential helper that hands it to git, enables bundle URIs, self-tests, and with
+#   credential helper that hands it to git, self-tests, and with
 #   ?repo=owner/name clones that repository right away.
 # Remove: git config --global --remove-section credential.https://{host}; rm -f ~/.config/git/{token_file}
 set -eu
@@ -351,7 +336,7 @@ command -v curl >/dev/null 2>&1 || {{ echo "$HOST: curl not found" >&2; exit 1; 
 GV="$(git --version | sed 's/^git version //; s/[^0-9.].*$//')"
 GMAJ="${{GV%%.*}}"; GREST="${{GV#*.}}"; GMIN="${{GREST%%.*}}"
 [ "$GMAJ" -gt 2 ] 2>/dev/null || [ "$GMAJ" -eq 2 ] && [ "${{GMIN:-0}}" -ge 46 ] || {{
-  echo "$HOST: git $GV is too old — need git >= 2.46 (credential authtype, bundle URIs)" >&2; exit 1; }}
+  echo "$HOST: git $GV is too old — need git >= 2.46 (credential authtype)" >&2; exit 1; }}
 mkdir -p "$DIR"
 {trust}{token}cat > "$HELPER.tmp" <<'{delim}'
 {helper}{delim}
@@ -362,11 +347,6 @@ if cmp -s "$HELPER.tmp" "$HELPER" 2>/dev/null; then rm -f "$HELPER.tmp"; else mv
 git config --global --replace-all "credential.https://$HOST.helper" ""
 git config --global --add "credential.https://$HOST.helper" "$HELPER"
 git config --global --unset-all "http.https://$HOST/.extraHeader" 2>/dev/null || true
-git config --global transfer.bundleURI true
-# fetch.bundleURI is a *URI*, recorded per clone (the clone command below sets it); a global
-# `true` makes every fetch warn "failed to download bundle from URI 'true'".
-git config --global --unset-all fetch.bundleURI 2>/dev/null || true
-git config --global fetch.uriProtocols https
 {self_test}{tail}"#,
         helper_file = helper_file(host),
         token_file = token_file(host),
@@ -436,12 +416,18 @@ mod tests {
             r.manual_clone
                 .contains("Authorization: Bearer $WALGIT_TOKEN")
         );
-        assert!(r.manual_clone.contains("-c fetch.bundleURI=https://git.example.com/acme/monorepo.git/bundles/catchup clone https://git.example.com/acme/monorepo.git"));
+        assert!(
+            r.manual_clone
+                .ends_with("clone https://git.example.com/acme/monorepo.git")
+        );
         assert_eq!(
             r.plain_clone,
-            "git clone -c fetch.bundleURI=https://git.example.com/acme/monorepo.git/bundles/catchup https://git.example.com/acme/monorepo.git"
+            "git clone https://git.example.com/acme/monorepo.git"
         );
-        assert!(r.blobless_clone.contains("--bundle-uri=https://git.example.com/acme/monorepo.git/bundles/list?filter=blob:none -c fetch.bundleURI=https://git.example.com/acme/monorepo.git/bundles/catchup?filter=blob:none"));
+        assert_eq!(
+            r.blobless_clone,
+            "git clone --filter=blob:none --sparse https://git.example.com/acme/monorepo.git"
+        );
         assert!(
             r.setup_text
                 .starts_with("# Tokens: sign in at https://git.example.com/_auth/tokens"),
@@ -532,9 +518,9 @@ mod tests {
                 "the installer embeds the helper verbatim"
             );
             assert_eq!(
-                script.contains("exec git clone -c fetch.bundleURI=https://git.example.com/acme/monorepo.git/bundles/catchup https://git.example.com/acme/monorepo.git"),
+                script.contains("exec git clone https://git.example.com/acme/monorepo.git"),
                 repo.is_some(),
-                "the clone the installer execs records the bundle list for later fetches"
+                "the installer clones the requested repository"
             );
         }
         // No auth: the installer never asks for a token.
@@ -633,17 +619,7 @@ mod tests {
         let tf = dir.path().join("xdg/git").join(token_file(HOST));
         assert_eq!(std::fs::read_to_string(&tf).unwrap(), "wgt_pasted\n");
         assert_eq!(first.matches("helper = \n").count(), 1, "{first}");
-        for key in ["helper = /", "bundleURI = true", "uriProtocols = https"] {
-            assert_eq!(
-                first.matches(key).count(),
-                1,
-                "{key} exactly once in:\n{first}"
-            );
-        }
-        assert!(
-            !first.contains("fetch]\n\tbundleURI"),
-            "no global fetch.bundleURI:\n{first}"
-        );
+        assert_eq!(first.matches("helper = /").count(), 1, "{first}");
         let files: Vec<_> = std::fs::read_dir(dir.path().join("xdg/git"))
             .unwrap()
             .map(|e| e.unwrap().file_name().into_string().unwrap())

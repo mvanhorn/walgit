@@ -7,7 +7,6 @@ members = [
     "crates/walgit-git",
     "crates/walgit-wal",
     "crates/walgit-server",
-    "crates/walgit-bundle",
     "crates/walgit-cli",
 ]
 
@@ -67,7 +66,6 @@ walgit-config = { path = "crates/walgit-config" }
 walgit-git = { path = "crates/walgit-git" }
 walgit-wal = { path = "crates/walgit-wal" }
 walgit-server = { path = "crates/walgit-server" }
-walgit-bundle = { path = "crates/walgit-bundle" }
 
 anyhow = "1"
 thiserror = "2"
@@ -131,7 +129,6 @@ hex = "0.4"
 humantime = "2"
 humantime-serde = "1"
 bytesize = { version = "2", features = ["serde"] }
-cron = "0.15"
 chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1", features = ["v4"] }
 dashmap = "6"

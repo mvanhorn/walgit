@@ -64,8 +64,7 @@ async fn follows_upstream_refs_through_the_wal_fast_forward_only() -> anyhow::Re
             c.server.roles = vec![walgit_config::Role::Serve, walgit_config::Role::Maintain];
             c.upstream.git = Some(up_url.clone());
             c.upstream.follow = vec!["refs/heads/main".into(), "refs/tags/v1".into()];
-            c.compaction.enabled = false;
-            c.bundles.enabled = false;
+            c.packs.enabled = false;
             c.wal.snapshot_every_entries = 0;
         })
     )?;

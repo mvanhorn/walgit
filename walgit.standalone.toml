@@ -4,21 +4,22 @@
 #   → https://walgit.localhost:8080/   (self-signed TLS; PORT=… moves it)
 #
 # Nothing in front of it: TLS, the web UI, the JSON API, smart HTTP (fetch/push),
-# bundle-uri and LFS bytes are all served by this process from the bucket below.
+# Git and LFS bytes are all served by this process from the bucket below.
 # An edge that wants to take work over announces it per request with
 # `X-Walgit-Capabilities: …` (`accel-redirect`, honoured only when
 # `server.accel_redirect = true`; see deploy/nginx.conf.example); hit directly,
 # walgit streams every byte itself.
 #
-# Prerequisites on this machine: `git` >= 2.46 (credential `authtype`, bundle URIs) and an
-# S3-compatible or GCS bucket. `just dev-store` starts rustfs in a container for local play.
+# Prerequisites on this machine: `git` >= 2.46 (credential `authtype`) and an
+# S3-compatible or GCS bucket. GNU coreutils (sort/comm) supports bounded pack planning.
+# `just dev-store` starts rustfs in a container for local play.
 # Every key not set here keeps the default documented in walgit.example.toml.
 
 [server]
 listen = "127.0.0.1:8080"                      # PORT env wins; also binds the ::1 twin
 public_url = "https://walgit.localhost:8080"   # browser origin; PORT rewrites the port
 auto_create_on_push = true                     # `git push` to a repository that does not exist yet creates it
-roles = []                                     # empty = every role: serve, maintain (checkpoints, bundles, compaction), events
+roles = []                                     # empty = every role: serve, maintain (checkpoints, compaction), events
 
 [server.tls]
 mode = "self_signed"              # generated once under <cache.dir>/tls/, published at /services/public/ca.pem.
@@ -66,32 +67,6 @@ force_path_style = true
 # backend = "gcs"
 # bucket = "my-walgit-bucket"
 # prefix = ""
-
-# Bundles (docs/BUNDLE_URI_DESIGN.md): one weekly full, then **chained** incrementals — each daily on the
-# previous daily (the first on the weekly), each hourly on the previous hourly (restarting from every new
-# daily). The list carries 1 weekly + <= 7 dailies + <= 24 hourlies, every one exactly its delta; git's
-# creationToken heuristic downloads them newest-first until one whose prerequisites it has, so a catch-up
-# is exactly the slots missed. walgit.example.toml has the other shape (every incremental on its base).
-[[bundles.strategy]]
-name = "weekly"
-kind = "full"
-schedule = "0 0 23 * * Sun"
-keep = 1
-backfill_max = 1
-
-[[bundles.strategy]]
-name = "daily"
-kind = "incremental"
-base = "weekly"
-schedule = "0 0 23 * * *"
-chain = true
-
-[[bundles.strategy]]
-name = "hourly"
-kind = "incremental"
-base = "daily"
-schedule = "0 0 * * * *"
-chain = true
 
 [cache]
 dir = "/tmp/walgit"               # materialized repositories + tls/; wiped = warmth lost, nothing else

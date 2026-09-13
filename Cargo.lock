@@ -1147,17 +1147,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "cron"
-version = "0.15.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5877d3fbf742507b66bc2a1945106bd30dd8504019d596901ddd012a4dd01740"
-dependencies = [
- "chrono",
- "once_cell",
- "winnow 0.6.26",
-]
-
-[[package]]
 name = "crossbeam-channel"
 version = "0.5.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5781,32 +5770,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5c3082ca00d5a5ef149bb8b555a72ae84c9c59f7250f013ac822ac2e49b19c64"
 
 [[package]]
-name = "walgit-bundle"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "bytes",
- "chrono",
- "cron",
- "futures",
- "hex",
- "metrics",
- "parking_lot",
- "prost",
- "sha1 0.10.7",
- "tempfile",
- "thiserror",
- "tokio",
- "tracing",
- "walgit-config",
- "walgit-git",
- "walgit-proto",
- "walgit-store",
- "walgit-wal",
-]
-
-[[package]]
 name = "walgit-cli"
 version = "0.1.0"
 dependencies = [
@@ -5833,7 +5796,6 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber",
- "walgit-bundle",
  "walgit-config",
  "walgit-git",
  "walgit-proto",
@@ -5848,9 +5810,10 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "bytesize",
- "cron",
+ "hex",
  "humantime-serde",
  "serde",
+ "sha2 0.10.9",
  "toml",
  "tracing",
 ]
@@ -5898,10 +5861,13 @@ dependencies = [
 name = "walgit-proto"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "bytes",
+ "hex",
  "prost",
  "prost-build",
  "prost-types",
+ "sha2 0.10.9",
 ]
 
 [[package]]
@@ -5961,7 +5927,6 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
- "walgit-bundle",
  "walgit-config",
  "walgit-git",
  "walgit-proto",
@@ -6035,6 +6000,7 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tokio-util",
+ "toml",
  "tracing",
  "uuid",
  "walgit-config",
@@ -6378,15 +6344,6 @@ name = "windows_x86_64_msvc"
 version = "0.52.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "589f6da84c646204747d1270a2a5661ea66ed1cced2631d546fdfb155959f9ec"
-
-[[package]]
-name = "winnow"
-version = "0.6.26"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1e90edd2ac1aa278a5c4599b1d89cf03074b610800f866d4026dc199d7929a28"
-dependencies = [
- "memchr",
-]
 
 [[package]]
 name = "winnow"

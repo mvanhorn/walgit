@@ -7,8 +7,8 @@
 #       -v walgit-cache:/var/lib/walgit \
 #       walgit
 #
-# The image carries git (upload-pack, repack, bundle, index-pack run as subprocesses),
-# git-lfs, CA certificates and tini. Config comes from /etc/walgit/walgit.toml or
+# The image carries git (upload-pack, repack, index-pack run as subprocesses),
+# git-lfs, GNU coreutils (bounded sort/comm), CA certificates and tini. Config comes from /etc/walgit/walgit.toml or
 # WALGIT__SECTION__KEY environment overrides; the local cache (materialized repositories,
 # a self-signed TLS cert) lives under /var/lib/walgit and can be wiped at any time — the
 # bucket is the only durable state. `nix build .#image` produces the same thing from flake.nix.
@@ -39,10 +39,10 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     && install -D target/release/walgit-server /out/bin/walgit-server
 
 # ---- 3. runtime -----------------------------------------------------------------------------
-# trixie ships git 2.47+: walgit wants >= 2.47 on the server (pack.writeReverseIndex, bundle-uri,
+# trixie ships git 2.47+: walgit wants >= 2.47 on the server (pack.writeReverseIndex,
 # `index-pack --rev-index`); clients need >= 2.46.
 FROM docker.io/library/debian:trixie-slim
-RUN apt-get update && apt-get install -y --no-install-recommends git git-lfs ca-certificates tini curl \
+RUN apt-get update && apt-get install -y --no-install-recommends git git-lfs coreutils ca-certificates tini curl \
     && rm -rf /var/lib/apt/lists/* \
     && git --version
 RUN useradd --uid 1000 --create-home --shell /bin/sh walgit \

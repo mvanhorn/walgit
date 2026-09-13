@@ -86,7 +86,7 @@ async fn signed_url_uploads_go_to_the_store_with_the_oid_bound_to_the_put() -> R
     *store.fake_signed_put_base.lock() = Some(FAKE_BUCKET.to_string());
     let server = Server::start_with_store_and_tweak(store, |c| {
         tokens(c);
-        c.lfs.serve_via = walgit_config::BundleServe::SignedUrl;
+        c.lfs.serve_via = walgit_config::LfsServe::SignedUrl;
         c.lfs.signed_url_ttl = std::time::Duration::from_secs(90);
     })
     .await?;
@@ -210,7 +210,7 @@ async fn a_store_that_cannot_bind_the_checksum_keeps_the_upload_on_walgit() -> R
         }
         let server = Server::start_with_store_and_tweak(Arc::new(store), |c| {
             tokens(c);
-            c.lfs.serve_via = walgit_config::BundleServe::SignedUrl;
+            c.lfs.serve_via = walgit_config::LfsServe::SignedUrl;
         })
         .await?;
         create_repo(&server).await?;
@@ -239,7 +239,7 @@ async fn an_object_over_the_cap_is_never_signed() -> Result<()> {
     *store.fake_signed_put_base.lock() = Some(FAKE_BUCKET.to_string());
     let server = Server::start_with_store_and_tweak(store, |c| {
         tokens(c);
-        c.lfs.serve_via = walgit_config::BundleServe::SignedUrl;
+        c.lfs.serve_via = walgit_config::LfsServe::SignedUrl;
         c.lfs.max_object_bytes = bytesize::ByteSize::b(1024);
     })
     .await?;
@@ -348,7 +348,7 @@ async fn git_lfs_pushes_straight_to_the_bucket_and_verifies_with_us() -> Result<
     *store.fake_signed_put_base.lock() = Some(bucket_base);
     let server = Server::start_with_store_and_tweak(store, |c| {
         tokens(c);
-        c.lfs.serve_via = walgit_config::BundleServe::SignedUrl;
+        c.lfs.serve_via = walgit_config::LfsServe::SignedUrl;
     })
     .await?;
     create_repo(&server).await?;

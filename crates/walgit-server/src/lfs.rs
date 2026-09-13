@@ -193,12 +193,12 @@ pub async fn batch(
             });
         } else if exists {
             let signed = match cfg.lfs.serve_via {
-                walgit_config::BundleServe::SignedUrl => store
+                walgit_config::LfsServe::SignedUrl => store
                     .signed_get_url(&key, st.cfg.lfs.signed_url_ttl)
                     .await
                     .ok()
                     .flatten(),
-                walgit_config::BundleServe::Proxy => None,
+                _ => None,
             };
             if signed.is_some() {
                 authenticated = Some(true);
@@ -265,7 +265,7 @@ async fn signed_upload(
     oid: &str,
     size: u64,
 ) -> Option<walgit_store::SignedPut> {
-    if cfg.lfs.serve_via != walgit_config::BundleServe::SignedUrl
+    if cfg.lfs.serve_via != walgit_config::LfsServe::SignedUrl
         || size > st.cfg.lfs.max_object_bytes.as_u64()
     {
         return None;
